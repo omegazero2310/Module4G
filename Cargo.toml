@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/modem-proto",
+    "crates/modemd",
+    "crates/modem-sim",
+    "modem-app/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+bytes = "1"
+prost = "0.14"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tonic = "0.14"
+tracing = "0.1"
+ulid = { version = "1", features = ["serde"] }

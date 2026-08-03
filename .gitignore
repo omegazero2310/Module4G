@@ -1,0 +1,7 @@
+/target
+/modem-app/node_modules
+/modem-app/dist
+/modem-app/src-tauri/target
+*.log
+.env
+
