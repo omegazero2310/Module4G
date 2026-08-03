@@ -1,6 +1,6 @@
 use crate::{
     ModemError,
-    at::{Frame, Framer},
+    at::{Dispatcher, Frame, Framer},
     settings::Settings,
 };
 use serialport::{SerialPort, SerialPortType};
@@ -20,7 +20,8 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const SMS_SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const INITIALIZATION_COMMANDS: &[&str] = &["AT+CMEE=2", "AT+CVHU=0", "AT+CMGF=1"];
-const OPTIONAL_INITIALIZATION_COMMANDS: &[&str] = &["AT+CLCC=1", "AT+CNMI=2,1,0,1,0"];
+const OPTIONAL_INITIALIZATION_COMMANDS: &[&str] =
+    &["AT+CSSN=1,1", "AT+CLCC=1", "AT+CNMI=2,1,0,1,0", "AT+CSDH=1"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PortCandidate {
@@ -105,6 +106,7 @@ pub fn monitor_with_commands(
     commands: mpsc::Receiver<AtRequest>,
 ) {
     let mut modem: Option<InitializedModem> = None;
+    let mut dispatcher = Dispatcher::default();
     let mut last_state: Option<HardwareState> = None;
     while !stop.load(Ordering::Relaxed) {
         if modem.as_ref().is_some_and(InitializedModem::is_present) {
@@ -120,6 +122,7 @@ pub fn monitor_with_commands(
                         } else {
                             COMMAND_TIMEOUT
                         },
+                        &mut dispatcher,
                     );
                     let _ = request.reply.send(result);
                 }
@@ -155,9 +158,13 @@ fn execute_command(
     payload: Option<&[u8]>,
     guarded: bool,
     timeout: Duration,
+    dispatcher: &mut Dispatcher,
 ) -> Result<Vec<String>, ModemError> {
     if guarded {
         crate::at::validate_console(command, false)?;
+    }
+    if command.starts_with("ATD") {
+        dispatcher.clear_urcs();
     }
     port.write_all(command.as_bytes())
         .map_err(|_| ModemError::Disconnected)?;
@@ -165,14 +172,17 @@ fn execute_command(
         .map_err(|_| ModemError::Disconnected)?;
     port.flush().map_err(|_| ModemError::Disconnected)?;
     let deadline = Instant::now() + timeout;
-    let mut framer = Framer::default();
     let mut lines = Vec::new();
     let mut buffer = [0_u8; 256];
     while Instant::now() < deadline {
         match port.read(&mut buffer) {
             Ok(0) => {}
             Ok(count) => {
-                for frame in framer.push(&buffer[..count]) {
+                let (frames, _) = dispatcher.push(&buffer[..count], Some(command));
+                if command.eq_ignore_ascii_case("AT+CLCC") {
+                    lines.extend(dispatcher.take_urcs());
+                }
+                for frame in frames {
                     if let Frame::Line(line) = &frame {
                         if line.eq_ignore_ascii_case(command) {
                             continue;
@@ -456,7 +466,7 @@ mod tests {
         );
         assert_eq!(
             OPTIONAL_INITIALIZATION_COMMANDS,
-            ["AT+CLCC=1", "AT+CNMI=2,1,0,1,0"]
+            ["AT+CSSN=1,1", "AT+CLCC=1", "AT+CNMI=2,1,0,1,0", "AT+CSDH=1"]
         );
     }
 

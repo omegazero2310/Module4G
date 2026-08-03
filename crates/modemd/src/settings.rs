@@ -8,6 +8,8 @@ pub struct Settings {
     pub port_override: Option<String>,
     pub baud: u32,
     pub call_timeout_seconds: u32,
+    #[serde(default = "default_voicemail_guard_seconds")]
+    pub voicemail_guard_seconds: u32,
     pub upload_pacing_ms: u32,
     pub max_audio_bytes: usize,
     pub ussd_code: String,
@@ -25,6 +27,7 @@ impl Default for Settings {
             port_override: None,
             baud: 115_200,
             call_timeout_seconds: 90,
+            voicemail_guard_seconds: default_voicemail_guard_seconds(),
             upload_pacing_ms: 10,
             max_audio_bytes: 200 * 1024,
             ussd_code: "*101#".into(),
@@ -63,6 +66,13 @@ impl Settings {
         }
         if self.ussd_timeout_seconds == 0 || self.call_timeout_seconds == 0 {
             return Err(ModemError::Validation("timeouts must be positive".into()));
+        }
+        if !(5..=60).contains(&self.voicemail_guard_seconds)
+            || self.voicemail_guard_seconds >= self.call_timeout_seconds
+        {
+            return Err(ModemError::Validation(
+                "voicemail guard must be 5 to 60 seconds and below the call timeout".into(),
+            ));
         }
         if self.call_timeout_seconds > 600 || self.ussd_timeout_seconds > 300 {
             return Err(ModemError::Validation(
@@ -103,6 +113,10 @@ impl Settings {
         }
         Ok(())
     }
+}
+
+const fn default_voicemail_guard_seconds() -> u32 {
+    15
 }
 
 #[cfg(test)]

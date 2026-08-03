@@ -11,6 +11,39 @@ pub struct Framer {
     buffer: Vec<u8>,
 }
 
+#[derive(Default)]
+pub struct Dispatcher {
+    framer: Framer,
+    pending_urcs: Vec<String>,
+}
+
+impl Dispatcher {
+    /// Keeps one framing buffer for the lifetime of the port and separates
+    /// unsolicited call notifications from the active command response.
+    pub fn push(&mut self, bytes: &[u8], command: Option<&str>) -> (Vec<Frame>, Vec<String>) {
+        let mut response = Vec::new();
+        let mut urcs = Vec::new();
+        for frame in self.framer.push(bytes) {
+            match frame {
+                Frame::Line(line) if crate::call::parse_urc(&line).is_some() => urcs.push(line),
+                Frame::Line(line)
+                    if command.is_some_and(|value| line.eq_ignore_ascii_case(value)) => {}
+                other => response.push(other),
+            }
+        }
+        self.pending_urcs.extend(urcs.iter().cloned());
+        (response, urcs)
+    }
+
+    pub fn take_urcs(&mut self) -> Vec<String> {
+        mem::take(&mut self.pending_urcs)
+    }
+
+    pub fn clear_urcs(&mut self) {
+        self.pending_urcs.clear();
+    }
+}
+
 impl Framer {
     pub fn push(&mut self, bytes: &[u8]) -> Vec<Frame> {
         self.buffer.extend_from_slice(bytes);
@@ -88,6 +121,14 @@ mod tests {
         assert_eq!(validate_console("AT+CSQ", false).unwrap(), "AT+CSQ");
         assert!(validate_console("AT+CMGS=1", false).is_err());
         assert!(validate_console("AT\rD", false).is_err());
+    }
+    #[test]
+    fn dispatcher_separates_interleaved_urcs() {
+        let mut d = Dispatcher::default();
+        let (response, urcs) = d.push(b"ATD123;\r\n+CSSI: 2\r\nOK\r\n", Some("ATD123;"));
+        assert_eq!(response, vec![Frame::Line("OK".into())]);
+        assert_eq!(urcs, vec!["+CSSI: 2"]);
+        assert_eq!(d.take_urcs(), vec!["+CSSI: 2"]);
     }
     proptest::proptest! {
         #[test] fn arbitrary_bytes_never_panic(chunks in proptest::collection::vec(proptest::collection::vec(any::<u8>(), 0..64), 0..30)) {

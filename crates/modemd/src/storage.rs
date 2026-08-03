@@ -30,6 +30,39 @@ impl Store {
              CREATE INDEX IF NOT EXISTS balance_created ON balance_checks(created_at_ms DESC, id DESC);
              CREATE TABLE IF NOT EXISTS uploaded_audio(id TEXT PRIMARY KEY, name TEXT NOT NULL, format TEXT NOT NULL, size INTEGER NOT NULL, module_path TEXT NOT NULL, created_at_ms INTEGER NOT NULL);"
         ).map_err(db_error)?;
+        let connection = self.connection()?;
+        let columns = {
+            let mut statement = connection
+                .prepare("PRAGMA table_info(calls)")
+                .map_err(db_error)?;
+            statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(db_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db_error)?
+        };
+        for (name, definition) in [
+            ("answer_classification", "TEXT NOT NULL DEFAULT 'unknown'"),
+            ("end_reason", "TEXT NOT NULL DEFAULT 'none'"),
+            ("forwarding_notification_seen", "INTEGER NOT NULL DEFAULT 0"),
+            ("connected_at_ms", "INTEGER"),
+            ("ended_at_ms", "INTEGER"),
+        ] {
+            if !columns.iter().any(|column| column == name) {
+                connection
+                    .execute(
+                        &format!("ALTER TABLE calls ADD COLUMN {name} {definition}"),
+                        [],
+                    )
+                    .map_err(db_error)?;
+            }
+        }
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO schema_migrations(version) VALUES (2)",
+                [],
+            )
+            .map_err(db_error)?;
         Ok(())
     }
 
@@ -76,7 +109,7 @@ mod tests {
     #[test]
     fn migrates_and_round_trips_settings() {
         let store = Store::memory().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 1);
+        assert_eq!(store.schema_version().unwrap(), 2);
         let mut expected = Settings::default();
         expected.port_override = Some("COM6".into());
         store.save_settings(&expected, 42).unwrap();

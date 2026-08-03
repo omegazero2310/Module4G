@@ -4,4 +4,4 @@
 /modem-app/src-tauri/target
 *.log
 .env
-
+/tmp/pdfs/*

@@ -11,6 +11,9 @@ mod windows_sim {
         if command.starts_with("SMS|") {
             return "+CMGS: 42\r\nOK\n";
         }
+        if command == "BALANCE" {
+            return "Thuê bao: 84XXXXXXXXX (HISCL):\r\n- TK gốc: 85.500đ, HSD: 00:00:00 02-10-2026.\r\n- TK tiền di động: 863đ, HSD: 00:00:00 01-01-2100.\r\n- TK tiền khuyến mại: 89.174đ.\r\nĐể tìm hiểu và đăng ký các gói data ưu đãi, truy cập https://vietteltelecom.vn/goidatahot\n";
+        }
         if command.starts_with("USSD|") {
             return "+CUSD: 0,\"Balance 125.50 THB\",15\r\nOK\n";
         }

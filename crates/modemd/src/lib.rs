@@ -2,6 +2,7 @@
 
 pub mod at;
 pub mod audio;
+pub mod call;
 pub mod hardware;
 pub mod settings;
 pub mod sms;

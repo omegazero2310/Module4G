@@ -2,8 +2,72 @@ use modemd::{at::validate_console, settings::Settings as CoreSettings};
 use serde::{Deserialize, Serialize};
 use std::{
     sync::Mutex,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
+
+fn log_event(area: &str, message: impl AsRef<str>) {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    eprintln!(
+        "[{}.{:03}] [{area}] {}",
+        elapsed.as_secs(),
+        elapsed.subsec_millis(),
+        message.as_ref()
+    );
+}
+
+fn logged_request(request: &str) -> String {
+    if request.starts_with("SMS|") {
+        "SMS send (destination and message redacted)".into()
+    } else if request.starts_with("DIAL|") {
+        "DIAL (destination redacted)".into()
+    } else if request.starts_with("USSD|") {
+        "USSD request (code redacted)".into()
+    } else if request == "BALANCE" {
+        "BALANCE check (response redacted)".into()
+    } else {
+        request.into()
+    }
+}
+
+fn logged_response(request: &str, response: &str) -> String {
+    if request == "BALANCE" {
+        return if response.starts_with("ERROR:") {
+            "ERROR (details redacted)".into()
+        } else {
+            "balance response received (content redacted)".into()
+        };
+    }
+
+    // Modems can echo dial strings or return caller IDs. Hide long digit runs in
+    // console logs while retaining ordinary result codes, RSSI, and error numbers.
+    let mut output = String::new();
+    let mut digits = String::new();
+    let flush_digits = |output: &mut String, digits: &mut String| {
+        if digits.len() >= 7 {
+            output.push_str("<redacted-number>");
+        } else {
+            output.push_str(digits);
+        }
+        digits.clear();
+    };
+    for character in response.trim().chars() {
+        if character.is_ascii_digit() {
+            digits.push(character);
+        } else {
+            flush_digits(&mut output, &mut digits);
+            output.push(character);
+        }
+    }
+    flush_digits(&mut output, &mut digits);
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -36,6 +100,7 @@ struct Settings {
     port_override: String,
     baud: u32,
     call_timeout_seconds: u32,
+    voicemail_guard_seconds: u32,
     upload_pacing_ms: u32,
     max_audio_bytes: usize,
     ussd_code: String,
@@ -53,6 +118,7 @@ impl From<CoreSettings> for Settings {
             port_override: value.port_override.unwrap_or_default(),
             baud: value.baud,
             call_timeout_seconds: value.call_timeout_seconds,
+            voicemail_guard_seconds: value.voicemail_guard_seconds,
             upload_pacing_ms: value.upload_pacing_ms,
             max_audio_bytes: value.max_audio_bytes,
             ussd_code: value.ussd_code,
@@ -72,6 +138,7 @@ impl From<Settings> for CoreSettings {
                 .then(|| value.port_override.trim().to_owned()),
             baud: value.baud,
             call_timeout_seconds: value.call_timeout_seconds,
+            voicemail_guard_seconds: value.voicemail_guard_seconds,
             upload_pacing_ms: value.upload_pacing_ms,
             max_audio_bytes: value.max_audio_bytes,
             ussd_code: value.ussd_code,
@@ -92,6 +159,9 @@ struct Record {
     state: String,
     detail: String,
     created_at_ms: u64,
+    answer_classification: String,
+    end_reason: String,
+    alerting_at_ms: u64,
 }
 
 struct AppState {
@@ -105,19 +175,45 @@ struct AppState {
 async fn request_line(request: &str) -> Result<String, String> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::windows::named_pipe::ClientOptions;
-    let mut client = ClientOptions::new()
-        .open(r"\\.\pipe\a7670-modemd-v1")
-        .map_err(|e| format!("Cannot connect to the local modem service: {e}"))?;
-    client
-        .write_all(format!("{request}\n").as_bytes())
-        .await
-        .map_err(|e| format!("Cannot send request: {e}"))?;
-    let mut response = String::new();
-    BufReader::new(client)
-        .read_line(&mut response)
-        .await
-        .map_err(|e| format!("Cannot read response: {e}"))?;
-    Ok(response)
+    let display_request = logged_request(request);
+    let started = Instant::now();
+    log_event("APP -> MODEM", &display_request);
+    let result = async {
+        let mut client = ClientOptions::new()
+            .open(r"\\.\pipe\a7670-modemd-v1")
+            .map_err(|e| format!("Cannot connect to the local modem service: {e}"))?;
+        client
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .map_err(|e| format!("Cannot send request: {e}"))?;
+        let mut response = String::new();
+        BufReader::new(client)
+            .read_line(&mut response)
+            .await
+            .map_err(|e| format!("Cannot read response: {e}"))?;
+        Ok::<_, String>(response)
+    }
+    .await;
+    match &result {
+        Ok(response) => log_event(
+            "MODEM -> APP",
+            format!(
+                "{} => {} ({} ms)",
+                display_request,
+                logged_response(request, response),
+                started.elapsed().as_millis()
+            ),
+        ),
+        Err(error) => log_event(
+            "MODEM ERROR",
+            format!(
+                "{} => {error} ({} ms)",
+                display_request,
+                started.elapsed().as_millis()
+            ),
+        ),
+    }
+    result
 }
 
 #[cfg(windows)]
@@ -147,6 +243,7 @@ async fn get_status() -> Result<Status, String> {
 
 #[tauri::command]
 fn get_settings(state: tauri::State<'_, AppState>) -> Result<Settings, String> {
+    log_event("APP", "Settings opened");
     Ok(state
         .settings
         .lock()
@@ -160,20 +257,23 @@ fn update_settings(
     settings: Settings,
     state: tauri::State<'_, AppState>,
 ) -> Result<Settings, String> {
+    log_event("APP", "Settings save requested (values not logged)");
     let core: CoreSettings = settings.into();
     core.validate().map_err(|e| e.to_string())?;
     *state.settings.lock().map_err(|_| "Settings lock failed")? = core.clone();
+    log_event("APP", "Settings validated and applied");
     Ok(core.into())
 }
 
 #[tauri::command]
 fn list_ports(state: tauri::State<'_, AppState>) -> Result<Vec<Port>, String> {
+    log_event("APP", "COM port scan started");
     let settings = state
         .settings
         .lock()
         .map_err(|_| "Settings lock failed")?
         .clone();
-    Ok(modemd::hardware::enumerate(&settings)
+    let ports: Vec<_> = modemd::hardware::enumerate(&settings)
         .unwrap_or_default()
         .into_iter()
         .map(|p| {
@@ -187,7 +287,12 @@ fn list_ports(state: tauri::State<'_, AppState>) -> Result<Vec<Port>, String> {
                 available: true,
             }
         })
-        .collect())
+        .collect();
+    log_event(
+        "APP",
+        format!("COM port scan completed: {} candidate(s)", ports.len()),
+    );
+    Ok(ports)
 }
 
 #[cfg(windows)]
@@ -245,6 +350,9 @@ async fn send_sms(
         state: "sent".into(),
         detail,
         created_at_ms: now_ms(),
+        answer_classification: String::new(),
+        end_reason: String::new(),
+        alerting_at_ms: 0,
     };
     state
         .sms
@@ -287,6 +395,9 @@ async fn make_call(
         state: "dialing".into(),
         detail,
         created_at_ms: now_ms(),
+        answer_classification: "unknown".into(),
+        end_reason: "none".into(),
+        alerting_at_ms: 0,
     };
     state
         .calls
@@ -316,6 +427,7 @@ async fn hang_up(state: tauri::State<'_, AppState>) -> Result<(), String> {
     {
         call.state = "ended".into();
         call.detail = "Local hang-up".into();
+        call.end_reason = "Local hang-up".into();
     }
     Ok(())
 }
@@ -362,15 +474,60 @@ async fn list_calls(state: tauri::State<'_, AppState>) -> Result<Vec<Record>, St
         .any(|call| is_live_call(&call.state));
     if has_live_call {
         let response = ensure_ok(request_line("CALLSTATUS").await?)?;
-        let mut calls = state.calls.lock().map_err(|_| "Call history lock failed")?;
-        if let Some(call) = calls.iter_mut().find(|call| is_live_call(&call.state)) {
-            if let Some(next) = call_state(&response) {
-                call.state = next.into();
-                call.detail = response;
-            } else if now_ms().saturating_sub(call.created_at_ms) >= 2_000 {
-                call.state = "ended".into();
-                call.detail = "Call is no longer reported by the modem".into();
+        let settings = state
+            .settings
+            .lock()
+            .map_err(|_| "Settings lock failed")?
+            .clone();
+        let current_ms = now_ms();
+        let (alert_timeout, overall_timeout) = {
+            let mut alert_timeout = false;
+            let mut overall_timeout = false;
+            let mut calls = state.calls.lock().map_err(|_| "Call history lock failed")?;
+            if let Some(call) = calls.iter_mut().find(|call| is_live_call(&call.state)) {
+                if let Some(next) = call_state(&response) {
+                    call.state = next.into();
+                    call.detail = response;
+                    match next {
+                        "connected" => call.answer_classification = "Answered (inferred)".into(),
+                        "ringing" => {
+                            if call.alerting_at_ms == 0 {
+                                call.alerting_at_ms = current_ms;
+                            }
+                        }
+                        "no answer" => {
+                            call.answer_classification = "No answer".into();
+                            call.end_reason = "Network no-answer".into();
+                        }
+                        "busy" => call.end_reason = "Busy".into(),
+                        "ended" => call.end_reason = "Remote or network hang-up".into(),
+                        _ => {}
+                    }
+                }
+                if is_live_call(&call.state)
+                    && call.alerting_at_ms != 0
+                    && current_ms.saturating_sub(call.alerting_at_ms)
+                        >= u64::from(settings.voicemail_guard_seconds) * 1_000
+                {
+                    call.state = "ended".into();
+                    call.detail = "Local alerting deadline reached".into();
+                    call.answer_classification = "No answer".into();
+                    call.end_reason = "Alert timeout".into();
+                    alert_timeout = true;
+                } else if is_live_call(&call.state)
+                    && current_ms.saturating_sub(call.created_at_ms)
+                        >= u64::from(settings.call_timeout_seconds) * 1_000
+                {
+                    call.state = "ended".into();
+                    call.detail = "Overall call safety timeout reached".into();
+                    call.end_reason = "Error".into();
+                    overall_timeout = true;
+                }
             }
+            (alert_timeout, overall_timeout)
+        };
+        if alert_timeout || overall_timeout {
+            ensure_ok(request_line("HANGUP").await?)?;
         }
     }
     Ok(state
@@ -400,22 +557,41 @@ mod tests {
         assert_eq!(call_state("+CLCC: 1,0,0,0,0"), Some("connected"));
         assert_eq!(call_state("NO ANSWER"), Some("no answer"));
         assert_eq!(call_state("BUSY"), Some("busy"));
+        assert_eq!(
+            call_state("+CLCC: 1,0,2,0,0 | VOICE CALL: END | NO CARRIER"),
+            Some("ended")
+        );
         assert_eq!(call_state(""), None);
+    }
+
+    #[test]
+    fn console_logging_redacts_private_request_data() {
+        assert_eq!(
+            logged_request("SMS|+66812345678|48656C6C6F"),
+            "SMS send (destination and message redacted)"
+        );
+        assert_eq!(
+            logged_request("DIAL|+66812345678"),
+            "DIAL (destination redacted)"
+        );
+        assert_eq!(
+            logged_response("AT+CLCC", "+CLCC: 1,0,0,0,0,\"+66812345678\",145\r\nOK\n"),
+            "+CLCC: 1,0,0,0,0,\"+<redacted-number>\",145 | OK"
+        );
+        assert_eq!(
+            logged_response("BALANCE", "Your balance is 100000 VND"),
+            "balance response received (content redacted)"
+        );
     }
 }
 
 #[cfg(windows)]
 #[tauri::command]
 async fn check_balance(state: tauri::State<'_, AppState>) -> Result<Record, String> {
-    let settings = state
-        .settings
-        .lock()
-        .map_err(|_| "Settings lock failed")?
-        .clone();
-    let raw = ensure_ok(request_line(&format!("USSD|{}", settings.ussd_code)).await?)?;
+    let raw = ensure_ok(request_line("BALANCE").await?)?;
     let record = Record {
         id: id(),
-        peer: settings.currency,
+        peer: "191".into(),
         body: raw.clone(),
         state: if raw.is_empty() {
             "requested".into()
@@ -424,6 +600,9 @@ async fn check_balance(state: tauri::State<'_, AppState>) -> Result<Record, Stri
         },
         detail: raw,
         created_at_ms: now_ms(),
+        answer_classification: String::new(),
+        end_reason: String::new(),
+        alerting_at_ms: 0,
     };
     state
         .balances
@@ -447,6 +626,7 @@ fn list_balance_checks(state: tauri::State<'_, AppState>) -> Result<Vec<Record>,
 }
 
 fn main() {
+    log_event("APP", "A7670 Modem application starting");
     tauri::Builder::default()
         .manage(AppState {
             settings: Mutex::new(CoreSettings::default()),

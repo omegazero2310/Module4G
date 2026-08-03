@@ -252,6 +252,8 @@ mod windows_host {
                     (Err(error), _) => format!("ERROR: {error}\n"),
                     (_, None) => "ERROR: invalid SMS payload\n".into(),
                 }
+            } else if request == "BALANCE" {
+                check_viettel_balance(&command_tx).await
             } else if let Some(code) = request.strip_prefix("USSD|") {
                 if code.is_empty() || code.len() > 64 {
                     "ERROR: invalid USSD code\n".into()
@@ -330,6 +332,101 @@ mod windows_host {
         }
     }
 
+    async fn check_viettel_balance(command_tx: &mpsc::Sender<hardware::AtRequest>) -> String {
+        let submitted = run_actor(
+            command_tx,
+            "AT+CMGS=\"191\"".into(),
+            Some(b"TK".to_vec()),
+            false,
+        )
+        .await;
+        if submitted.starts_with("ERROR:") {
+            return submitted;
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while tokio::time::Instant::now() < deadline {
+            let response =
+                run_actor(command_tx, "AT+CMGL=\"REC UNREAD\"".into(), None, false).await;
+            if response.starts_with("ERROR:") {
+                return response;
+            }
+            if let Some(message) = viettel_balance_message(&response) {
+                return format!("{message}\n");
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        "ERROR: timed out waiting for the balance SMS from 191\n".into()
+    }
+
+    fn viettel_balance_message(response: &str) -> Option<String> {
+        let parts: Vec<_> = response.split(" | ").map(str::trim).collect();
+        let header = parts.iter().position(|part| {
+            part.starts_with("+CMGL:")
+                && csv_field(part, 2).is_some_and(|sender| {
+                    sender.trim().trim_matches('\"').eq_ignore_ascii_case("191")
+                })
+        })?;
+        let body: Vec<_> = parts[header + 1..]
+            .iter()
+            .take_while(|part| !part.starts_with("+CMGL:") && **part != "OK")
+            .copied()
+            .collect();
+        if body.is_empty() {
+            return None;
+        }
+
+        let body = body.join("\n");
+        let dcs = csv_field(parts[header], 8).and_then(|value| value.trim().parse::<u8>().ok());
+        let is_ucs2 = dcs.is_some_and(dcs_uses_ucs2)
+            || (dcs.is_none() && body.starts_with("00") && body.len() % 4 == 0);
+        if is_ucs2 {
+            decode_ucs2_hex(&body)
+        } else {
+            Some(body)
+        }
+    }
+
+    fn dcs_uses_ucs2(dcs: u8) -> bool {
+        (dcs & 0xc0 == 0 && dcs & 0x0c == 0x08) || dcs & 0xf0 == 0xe0
+    }
+
+    fn csv_field(value: &str, wanted: usize) -> Option<&str> {
+        let mut quoted = false;
+        let mut field = 0;
+        let mut start = 0;
+        for (index, byte) in value.bytes().enumerate() {
+            match byte {
+                b'"' => quoted = !quoted,
+                b',' if !quoted => {
+                    if field == wanted {
+                        return Some(value[start..index].trim());
+                    }
+                    field += 1;
+                    start = index + 1;
+                }
+                _ => {}
+            }
+        }
+        (field == wanted).then(|| value[start..].trim())
+    }
+
+    fn decode_ucs2_hex(value: &str) -> Option<String> {
+        if value.is_empty()
+            || value.len() % 4 != 0
+            || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        let units = (0..value.len())
+            .step_by(4)
+            .map(|index| u16::from_str_radix(&value[index..index + 4], 16).ok())
+            .collect::<Option<Vec<_>>>()?;
+        char::decode_utf16(units)
+            .collect::<Result<String, _>>()
+            .ok()
+    }
+
     fn decode_hex(value: &str) -> Option<Vec<u8>> {
         if value.len() % 2 != 0 {
             return None;
@@ -338,6 +435,44 @@ mod windows_host {
             .step_by(2)
             .map(|index| u8::from_str_radix(&value[index..index + 2], 16).ok())
             .collect()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::viettel_balance_message;
+
+        #[test]
+        fn extracts_viettel_balance_sms_from_191() {
+            let response = "+CMGL: 7,\"REC UNREAD\",\"191\",\"\",\"26/08/03,10:00:00+28\" | Thuê bao: 84XXXXXXXXX (HISCL): | - TK gốc: 85.500đ, HSD: 00:00:00 02-10-2026. | - TK tiền di động: 863đ, HSD: 00:00:00 01-01-2100. | - TK tiền khuyến mại: 89.174đ. | OK";
+            let message = viettel_balance_message(response).unwrap();
+            assert!(message.contains("TK gốc: 85.500đ"));
+            assert!(message.contains("TK tiền khuyến mại: 89.174đ"));
+        }
+
+        #[test]
+        fn ignores_messages_from_other_senders() {
+            assert!(
+                viettel_balance_message(
+                    "+CMGL: 8,\"REC UNREAD\",\"123\",\"\",\"\" | Not a balance | OK"
+                )
+                .is_none()
+            );
+        }
+
+        #[test]
+        fn decodes_ucs2_viettel_balance_sms_using_dcs() {
+            let response = "+CMGL: 9,\"REC UNREAD\",\"191\",\"\",\"26/08/03,10:00:00+28\",129,0,0,8,\"+84000000000\",145,67 | 00540068007500EA002000620061006F003A002000380034005800580058005800580058005800580058002000280054004F004D003600390030005F003100320029003A0020000A002D00200054004B002000671ED10063003A002000310039002E0038003000300111002C0020004800530044003A002000300030003A00300030003A0030 | OK";
+            assert_eq!(
+                viettel_balance_message(response).unwrap(),
+                "Thuê bao: 84XXXXXXXXX (TOM690_12): \n- TK gốc: 19.800đ, HSD: 00:00:0"
+            );
+        }
+
+        #[test]
+        fn does_not_decode_gsm_7_bit_hex_looking_text() {
+            let response = "+CMGL: 10,\"REC UNREAD\",\"191\",\"\",\"26/08/03,10:00:00+28\",129,0,0,0,\"+84000000000\",145,4 | 1234 | OK";
+            assert_eq!(viettel_balance_message(response).unwrap(), "1234");
+        }
     }
 }
 
