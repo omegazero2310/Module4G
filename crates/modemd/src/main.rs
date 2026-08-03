@@ -1,6 +1,10 @@
 #[cfg(windows)]
 mod windows_host {
-    use modemd::{hardware, settings::Settings};
+    use modemd::{
+        hardware,
+        settings::Settings,
+        storage::{BalanceRecord, SmsRecord, Store},
+    };
     use std::{
         ffi::{OsString, c_void},
         io, ptr,
@@ -124,6 +128,13 @@ mod windows_host {
     }
 
     async fn serve(stop: impl Future<Output = ()>) -> io::Result<()> {
+        let data_dir = std::env::var_os("ProgramData")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("A7670 Modem");
+        std::fs::create_dir_all(&data_dir)?;
+        let store =
+            Arc::new(Store::open(data_dir.join("modemd.sqlite3")).map_err(io::Error::other)?);
         let device_state = Arc::new(RwLock::new(hardware::HardwareState::Disconnected));
         let monitor_state = Arc::clone(&device_state);
         let monitor_stop = Arc::new(AtomicBool::new(false));
@@ -166,7 +177,7 @@ mod windows_host {
                 },
                 connected = server.connect() => {
                     connected?;
-                    tokio::spawn(handle_client(server, Arc::clone(&device_state), command_tx.clone()));
+                    tokio::spawn(handle_client(server, Arc::clone(&device_state), command_tx.clone(), Arc::clone(&store)));
                 }
             }
         }
@@ -220,12 +231,15 @@ mod windows_host {
         server: tokio::net::windows::named_pipe::NamedPipeServer,
         device_state: Arc<RwLock<hardware::HardwareState>>,
         command_tx: mpsc::Sender<hardware::AtRequest>,
+        store: Arc<Store>,
     ) -> io::Result<()> {
         let mut stream = BufReader::new(server);
         let mut line = String::new();
         while stream.read_line(&mut line).await? != 0 {
             let request = line.trim();
-            let response = if request == "STATUS" {
+            let response = if request.starts_with('{') {
+                handle_json(request, &command_tx, &store).await
+            } else if request == "STATUS" {
                 let state = device_state.read().unwrap_or_else(|lock| lock.into_inner());
                 let state = match &*state {
                     hardware::HardwareState::Ready { port_name } => format!("Ready\t{port_name}"),
@@ -304,6 +318,223 @@ mod windows_host {
             line.clear();
         }
         Ok(())
+    }
+
+    async fn handle_json(
+        request: &str,
+        tx: &mpsc::Sender<hardware::AtRequest>,
+        store: &Store,
+    ) -> String {
+        let value: serde_json::Value = match serde_json::from_str(request) {
+            Ok(v) => v,
+            Err(e) => return json_error(e),
+        };
+        let command = value
+            .get("command")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default();
+        let result: Result<serde_json::Value, String> = match command {
+            "list_sms" => store
+                .list_sms(1000)
+                .map(|mut records| {
+                    // Normalize rows synchronized by older versions too, so an
+                    // upgrade fixes the visible list without deleting history.
+                    for record in &mut records {
+                        let explicit = record.encoding.eq_ignore_ascii_case("UCS2")
+                            || (record.dcs >= 0
+                                && ((record.dcs as u8 & 0xc0 == 0
+                                    && record.dcs as u8 & 0x0c == 0x08)
+                                    || record.dcs as u8 & 0xf0 == 0xe0));
+                        if let Some(body) = modemd::sms::decode_ucs2_body(&record.body, explicit) {
+                            record.body = body;
+                            record.encoding = "UCS2".into();
+                            record.length = record.body.chars().count() as i32;
+                        }
+                    }
+                    serde_json::to_value(records).unwrap()
+                })
+                .map_err(|e| e.to_string()),
+            "list_balances" => store
+                .list_balances(1000)
+                .map(|x| serde_json::to_value(x).unwrap())
+                .map_err(|e| e.to_string()),
+            "send_sms" => send_sms_json(value, tx, store)
+                .await
+                .map(|x| serde_json::to_value(x).unwrap()),
+            "sync_sms" => sync_sms_json(tx, store)
+                .await
+                .map(|x| serde_json::json!({"count":x})),
+            "check_balance" => balance_json(tx, store)
+                .await
+                .map(|x| serde_json::to_value(x).unwrap()),
+            _ => Err("unknown JSON command".into()),
+        };
+        match result {
+            Ok(data) => serde_json::json!({"ok":true,"data":data}).to_string() + "\n",
+            Err(error) => serde_json::json!({"ok":false,"error":error}).to_string() + "\n",
+        }
+    }
+    fn json_error(e: impl std::fmt::Display) -> String {
+        serde_json::json!({"ok":false,"error":e.to_string()}).to_string() + "\n"
+    }
+    fn now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64
+    }
+    async fn send_sms_json(
+        v: serde_json::Value,
+        tx: &mpsc::Sender<hardware::AtRequest>,
+        store: &Store,
+    ) -> Result<SmsRecord, String> {
+        let peer = modemd::sms::normalize_number(
+            v.get("destination")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default(),
+        )
+        .map_err(|e| e.to_string())?;
+        let body = v
+            .get("body")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_owned();
+        modemd::sms::validate_body(&body).map_err(|e| e.to_string())?;
+        let lines = actor_lines(
+            tx,
+            format!("AT+CMGS=\"{peer}\""),
+            Some(body.clone().into_bytes()),
+        )
+        .await?;
+        let mr = lines
+            .iter()
+            .find_map(|x| x.strip_prefix("+CMGS:").map(|v| v.trim().to_owned()))
+            .unwrap_or_default();
+        let r = SmsRecord {
+            id: ulid::Ulid::new().to_string(),
+            direction: "outbound".into(),
+            peer,
+            body: body.clone(),
+            state: "submitted".into(),
+            message_reference: mr,
+            created_at_ms: now(),
+            kind: "submitted".into(),
+            source: "app".into(),
+            encoding: modemd::sms::validate_body(&body).unwrap_or("").into(),
+            length: body.chars().count() as i32,
+            ..Default::default()
+        };
+        store.save_sms(&r).map_err(|e| e.to_string())?;
+        Ok(r)
+    }
+    async fn actor_lines(
+        tx: &mpsc::Sender<hardware::AtRequest>,
+        command: String,
+        payload: Option<Vec<u8>>,
+    ) -> Result<Vec<String>, String> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        tx.send(hardware::AtRequest {
+            command,
+            payload,
+            guarded: false,
+            reply,
+        })
+        .map_err(|_| "modem command actor unavailable".to_owned())?;
+        tokio::time::timeout(Duration::from_secs(35), rx)
+            .await
+            .map_err(|_| "modem command timed out".to_owned())?
+            .map_err(|_| "modem command actor stopped".to_owned())?
+            .map_err(|e| e.to_string())
+    }
+    async fn sync_sms_json(
+        tx: &mpsc::Sender<hardware::AtRequest>,
+        store: &Store,
+    ) -> Result<usize, String> {
+        actor_lines(tx, "AT+CPMS=\"SM\",\"SM\",\"SM\"".into(), None).await?;
+        let lines = actor_lines(tx, "AT+CMGL=\"ALL\"".into(), None).await?;
+        let parsed = modemd::sms::parse_cmgl(&lines);
+        let stamp = now();
+        let records = parsed
+            .into_iter()
+            .map(|x| {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                (
+                    x.index,
+                    &x.modem_status,
+                    &x.peer,
+                    &x.body,
+                    &x.modem_timestamp,
+                )
+                    .hash(&mut h);
+                SmsRecord {
+                    id: ulid::Ulid::new().to_string(),
+                    direction: x.direction,
+                    peer: x.peer,
+                    body: x.body,
+                    state: match x.modem_status.as_str() {
+                        "REC UNREAD" => "unread",
+                        "REC READ" => "read",
+                        "STO SENT" => "sent",
+                        "STO UNSENT" => "unsent",
+                        _ => "status-report",
+                    }
+                    .into(),
+                    message_reference: x.message_reference,
+                    created_at_ms: stamp,
+                    kind: x.kind,
+                    source: "sim".into(),
+                    storage: "SM".into(),
+                    storage_index: x.index,
+                    modem_status: x.modem_status,
+                    modem_timestamp: x.modem_timestamp,
+                    encoding: x.encoding,
+                    dcs: x.dcs,
+                    length: x.length,
+                    service_center: x.service_center,
+                    delivery_status: x.delivery_status,
+                    synchronized_at_ms: stamp,
+                    present_on_modem: true,
+                    fingerprint: format!("{:016x}", h.finish()),
+                    ..Default::default()
+                }
+            })
+            .collect::<Vec<_>>();
+        store.sync_sms(&records, stamp).map_err(|e| e.to_string())?;
+        Ok(records.len())
+    }
+    async fn balance_json(
+        tx: &mpsc::Sender<hardware::AtRequest>,
+        store: &Store,
+    ) -> Result<BalanceRecord, String> {
+        let raw = check_viettel_balance(tx).await;
+        if raw.starts_with("ERROR:") {
+            return Err(raw.trim().into());
+        }
+        let raw = raw.trim_end().to_owned();
+        let stamp = now();
+        let sms = SmsRecord {
+            id: ulid::Ulid::new().to_string(),
+            direction: "inbound".into(),
+            peer: "191".into(),
+            body: raw.clone(),
+            state: "received".into(),
+            created_at_ms: stamp,
+            kind: "received".into(),
+            source: "balance".into(),
+            length: raw.chars().count() as i32,
+            ..Default::default()
+        };
+        store.save_sms(&sms).map_err(|e| e.to_string())?;
+        let b = BalanceRecord {
+            id: ulid::Ulid::new().to_string(),
+            raw,
+            created_at_ms: stamp,
+            sms_id: sms.id,
+            ..Default::default()
+        };
+        store.save_balance(&b).map_err(|e| e.to_string())?;
+        Ok(b)
     }
 
     async fn run_actor(

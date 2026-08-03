@@ -18,7 +18,13 @@ fn log_event(area: &str, message: impl AsRef<str>) {
 }
 
 fn logged_request(request: &str) -> String {
-    if request.starts_with("SMS|") {
+    if request.starts_with('{') {
+        let command = serde_json::from_str::<serde_json::Value>(request)
+            .ok()
+            .and_then(|v| v.get("command").and_then(|x| x.as_str()).map(str::to_owned))
+            .unwrap_or_else(|| "invalid".into());
+        return format!("JSON {command} (SMS and balance content redacted)");
+    } else if request.starts_with("SMS|") {
         "SMS send (destination and message redacted)".into()
     } else if request.starts_with("DIAL|") {
         "DIAL (destination redacted)".into()
@@ -32,6 +38,13 @@ fn logged_request(request: &str) -> String {
 }
 
 fn logged_response(request: &str, response: &str) -> String {
+    if request.starts_with('{') {
+        return if response.contains("\"ok\":true") {
+            "JSON response received (SMS and balance content redacted)".into()
+        } else {
+            "JSON request failed (details redacted)".into()
+        };
+    }
     if request == "BALANCE" {
         return if response.starts_with("ERROR:") {
             "ERROR (details redacted)".into()
@@ -81,7 +94,7 @@ struct Status {
     last_error: String,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Port {
     name: String,
@@ -147,8 +160,9 @@ impl From<Settings> for CoreSettings {
     }
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(default)]
 struct Record {
     id: String,
     peer: String,
@@ -160,15 +174,63 @@ struct Record {
     end_reason: String,
     alerting_at_ms: u64,
     release_cause: String,
+    direction: String,
+    kind: String,
+    source: String,
+    storage: String,
+    storage_index: i32,
+    modem_status: String,
+    modem_timestamp: String,
+    encoding: String,
+    dcs: i32,
+    length: i32,
+    service_center: String,
+    message_reference: String,
+    delivery_status: String,
+    synchronized_at_ms: i64,
+    present_on_modem: bool,
+    sms_id: String,
     #[serde(skip)]
     voice_begin_seen: bool,
 }
 
 struct AppState {
     settings: Mutex<CoreSettings>,
-    sms: Mutex<Vec<Record>>,
     calls: Mutex<Vec<Record>>,
-    balances: Mutex<Vec<Record>>,
+}
+
+impl Default for Record {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            peer: String::new(),
+            body: String::new(),
+            state: String::new(),
+            detail: String::new(),
+            created_at_ms: 0,
+            answer_classification: String::new(),
+            end_reason: String::new(),
+            alerting_at_ms: 0,
+            release_cause: String::new(),
+            direction: String::new(),
+            kind: String::new(),
+            source: String::new(),
+            storage: String::new(),
+            storage_index: -1,
+            modem_status: String::new(),
+            modem_timestamp: String::new(),
+            encoding: String::new(),
+            dcs: -1,
+            length: 0,
+            service_center: String::new(),
+            message_reference: String::new(),
+            delivery_status: String::new(),
+            synchronized_at_ms: 0,
+            present_on_modem: false,
+            sms_id: String::new(),
+            voice_begin_seen: false,
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -326,42 +388,41 @@ fn ensure_ok(response: String) -> Result<String, String> {
 }
 
 #[cfg(windows)]
+async fn request_json<T: serde::de::DeserializeOwned>(
+    value: serde_json::Value,
+) -> Result<T, String> {
+    let raw = request_line(&value.to_string()).await?;
+    let envelope: serde_json::Value =
+        serde_json::from_str(raw.trim()).map_err(|e| format!("Invalid service response: {e}"))?;
+    if !envelope
+        .get("ok")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false)
+    {
+        return Err(envelope
+            .get("error")
+            .and_then(|x| x.as_str())
+            .unwrap_or("Service request failed")
+            .to_owned());
+    }
+    serde_json::from_value(envelope.get("data").cloned().unwrap_or_default())
+        .map_err(|e| format!("Invalid service data: {e}"))
+}
+
+#[cfg(windows)]
 #[tauri::command]
 async fn send_sms(
     destination: String,
     body: String,
-    state: tauri::State<'_, AppState>,
+    _state: tauri::State<'_, AppState>,
 ) -> Result<Record, String> {
     let destination = modemd::sms::normalize_number(&destination).map_err(|e| e.to_string())?;
     let encoding = modemd::sms::validate_body(&body).map_err(|e| e.to_string())?;
     if encoding != "GSM-7" {
         return Err("UCS2 modem transmission is not available yet; use GSM-7 text".into());
     }
-    let payload: String = body
-        .as_bytes()
-        .iter()
-        .map(|byte| format!("{byte:02X}"))
-        .collect();
-    let detail = ensure_ok(request_line(&format!("SMS|{destination}|{payload}")).await?)?;
-    let record = Record {
-        id: id(),
-        peer: destination,
-        body,
-        state: "sent".into(),
-        detail,
-        created_at_ms: now_ms(),
-        answer_classification: String::new(),
-        end_reason: String::new(),
-        alerting_at_ms: 0,
-        release_cause: String::new(),
-        voice_begin_seen: false,
-    };
-    state
-        .sms
-        .lock()
-        .map_err(|_| "SMS history lock failed")?
-        .insert(0, record.clone());
-    Ok(record)
+    request_json(serde_json::json!({"command":"send_sms","destination":destination,"body":body}))
+        .await
 }
 #[cfg(not(windows))]
 #[tauri::command]
@@ -374,12 +435,35 @@ async fn send_sms(
 }
 
 #[tauri::command]
-fn list_sms(state: tauri::State<'_, AppState>) -> Result<Vec<Record>, String> {
-    Ok(state
-        .sms
-        .lock()
-        .map_err(|_| "SMS history lock failed")?
-        .clone())
+async fn list_sms(_state: tauri::State<'_, AppState>) -> Result<Vec<Record>, String> {
+    #[cfg(windows)]
+    {
+        request_json(serde_json::json!({"command":"list_sms"})).await
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(Vec::new())
+    }
+}
+
+#[tauri::command]
+async fn sync_sms() -> Result<usize, String> {
+    #[cfg(windows)]
+    {
+        #[derive(Deserialize)]
+        struct Count {
+            count: usize,
+        }
+        Ok(
+            request_json::<Count>(serde_json::json!({"command":"sync_sms"}))
+                .await?
+                .count,
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        Err("SMS synchronization is available only on Windows.".into())
+    }
 }
 
 #[cfg(windows)]
@@ -402,6 +486,7 @@ async fn make_call(
         alerting_at_ms: 0,
         release_cause: String::new(),
         voice_begin_seen: false,
+        ..Default::default()
     };
     state
         .calls
@@ -642,6 +727,7 @@ mod tests {
             alerting_at_ms: 0,
             release_cause: String::new(),
             voice_begin_seen: false,
+            ..Default::default()
         }
     }
 
@@ -676,36 +762,21 @@ mod tests {
             logged_response("BALANCE", "Your balance is 100000 VND"),
             "balance response received (content redacted)"
         );
+        assert_eq!(
+            logged_response(
+                "{\"command\":\"list_sms\"}",
+                "{\"ok\":true,\"data\":[{\"body\":\"secret\"}]}"
+            ),
+            "JSON response received (SMS and balance content redacted)"
+        );
     }
 }
 
 #[cfg(windows)]
 #[tauri::command]
-async fn check_balance(state: tauri::State<'_, AppState>) -> Result<Record, String> {
-    let raw = ensure_ok(request_line("BALANCE").await?)?;
-    let record = Record {
-        id: id(),
-        peer: "191".into(),
-        body: raw.clone(),
-        state: if raw.is_empty() {
-            "requested".into()
-        } else {
-            "received".into()
-        },
-        detail: raw,
-        created_at_ms: now_ms(),
-        answer_classification: String::new(),
-        end_reason: String::new(),
-        alerting_at_ms: 0,
-        release_cause: String::new(),
-        voice_begin_seen: false,
-    };
-    state
-        .balances
-        .lock()
-        .map_err(|_| "Balance history lock failed")?
-        .insert(0, record.clone());
-    Ok(record)
+async fn check_balance(_state: tauri::State<'_, AppState>) -> Result<Record, String> {
+    let wire: BalanceWire = request_json(serde_json::json!({"command":"check_balance"})).await?;
+    Ok(wire.into())
 }
 #[cfg(not(windows))]
 #[tauri::command]
@@ -713,12 +784,44 @@ async fn check_balance(_state: tauri::State<'_, AppState>) -> Result<Record, Str
     Err("Balance checks are available only on Windows.".into())
 }
 #[tauri::command]
-fn list_balance_checks(state: tauri::State<'_, AppState>) -> Result<Vec<Record>, String> {
-    Ok(state
-        .balances
-        .lock()
-        .map_err(|_| "Balance history lock failed")?
-        .clone())
+async fn list_balance_checks(_state: tauri::State<'_, AppState>) -> Result<Vec<Record>, String> {
+    #[cfg(windows)]
+    {
+        Ok(
+            request_json::<Vec<BalanceWire>>(serde_json::json!({"command":"list_balances"}))
+                .await?
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(Vec::new())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BalanceWire {
+    id: String,
+    raw: String,
+    created_at_ms: i64,
+    sms_id: String,
+}
+impl From<BalanceWire> for Record {
+    fn from(x: BalanceWire) -> Self {
+        Record {
+            id: x.id,
+            peer: "191".into(),
+            body: x.raw.clone(),
+            detail: x.raw,
+            state: "received".into(),
+            created_at_ms: x.created_at_ms as u64,
+            sms_id: x.sms_id,
+            ..Default::default()
+        }
+    }
 }
 
 fn main() {
@@ -726,9 +829,7 @@ fn main() {
     tauri::Builder::default()
         .manage(AppState {
             settings: Mutex::new(CoreSettings::default()),
-            sms: Mutex::new(Vec::new()),
             calls: Mutex::new(Vec::new()),
-            balances: Mutex::new(Vec::new()),
         })
         .invoke_handler(tauri::generate_handler![
             get_status,
@@ -737,6 +838,7 @@ fn main() {
             list_ports,
             execute_at,
             send_sms,
+            sync_sms,
             list_sms,
             make_call,
             hang_up,

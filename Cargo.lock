@@ -1930,6 +1930,7 @@ version = "0.1.0"
 dependencies = [
  "modemd",
  "serde",
+ "serde_json",
  "serialport",
  "tauri",
  "tauri-build",

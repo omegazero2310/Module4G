@@ -20,6 +20,21 @@ mod windows_sim {
 
     fn response(command: &str, scenario: &mut CallScenario) -> &'static str {
         let command = command.trim();
+        if command.contains("\"command\":\"sync_sms\"") {
+            return "{\"ok\":true,\"data\":{\"count\":7}}\n";
+        }
+        if command.contains("\"command\":\"list_sms\"") {
+            return "{\"ok\":true,\"data\":[{\"id\":\"sim-unread\",\"direction\":\"inbound\",\"peer\":\"191\",\"body\":\"Balance line one\\nBalance line two\",\"state\":\"unread\",\"detail\":\"\",\"createdAtMs\":1785722400000,\"answerClassification\":\"\",\"endReason\":\"\",\"alertingAtMs\":0,\"releaseCause\":\"\",\"kind\":\"received\",\"source\":\"sim\",\"storage\":\"SM\",\"storageIndex\":1,\"modemStatus\":\"REC UNREAD\",\"modemTimestamp\":\"26/08/03,10:00:00+28\",\"encoding\":\"GSM\",\"dcs\":0,\"length\":33,\"serviceCenter\":\"\",\"messageReference\":\"\",\"deliveryStatus\":\"\",\"synchronizedAtMs\":1785722400000,\"presentOnModem\":true,\"smsId\":\"\"}]}\n";
+        }
+        if command.contains("\"command\":\"list_balances\"") {
+            return "{\"ok\":true,\"data\":[]}\n";
+        }
+        if command.contains("\"command\":\"check_balance\"") {
+            return "{\"ok\":true,\"data\":{\"id\":\"balance-1\",\"raw\":\"Tai khoan goc: 85.500d\\nKhuyen mai: 89.174d\",\"value\":null,\"currency\":\"\",\"error\":\"\",\"createdAtMs\":1785722400000,\"smsId\":\"balance-sms-1\"}}\n";
+        }
+        if command.contains("\"command\":\"send_sms\"") {
+            return "{\"ok\":true,\"data\":{\"id\":\"sent-1\",\"direction\":\"outbound\",\"peer\":\"+66812345678\",\"body\":\"simulated\",\"state\":\"submitted\",\"detail\":\"\",\"createdAtMs\":1785722400000,\"answerClassification\":\"\",\"endReason\":\"\",\"alertingAtMs\":0,\"releaseCause\":\"\",\"kind\":\"submitted\",\"source\":\"app\",\"storage\":\"\",\"storageIndex\":-1,\"modemStatus\":\"\",\"modemTimestamp\":\"\",\"encoding\":\"GSM-7\",\"dcs\":-1,\"length\":9,\"serviceCenter\":\"\",\"messageReference\":\"42\",\"deliveryStatus\":\"\",\"synchronizedAtMs\":0,\"presentOnModem\":false,\"smsId\":\"\"}}\n";
+        }
         if command.starts_with("SMS|") {
             return "+CMGS: 42\r\nOK\n";
         }
