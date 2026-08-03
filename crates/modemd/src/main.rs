@@ -269,6 +269,8 @@ mod windows_host {
                 run_actor(&command_tx, "ATH".into(), None, false).await
             } else if request == "CALLSTATUS" {
                 run_actor(&command_tx, "AT+CLCC".into(), None, false).await
+            } else if request == "CALLCAUSE" {
+                run_actor(&command_tx, "AT+CEER".into(), None, false).await
             } else if request.starts_with("AT") {
                 match modemd::at::validate_console(request, false) {
                     Err(error) => format!("ERROR: {error}\n"),

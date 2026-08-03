@@ -125,10 +125,10 @@ mod tests {
     #[test]
     fn dispatcher_separates_interleaved_urcs() {
         let mut d = Dispatcher::default();
-        let (response, urcs) = d.push(b"ATD123;\r\n+CSSI: 2\r\nOK\r\n", Some("ATD123;"));
+        let (response, urcs) = d.push(b"ATD123;\r\nVOICE CALL: BEGIN\r\nOK\r\n", Some("ATD123;"));
         assert_eq!(response, vec![Frame::Line("OK".into())]);
-        assert_eq!(urcs, vec!["+CSSI: 2"]);
-        assert_eq!(d.take_urcs(), vec!["+CSSI: 2"]);
+        assert_eq!(urcs, vec!["VOICE CALL: BEGIN"]);
+        assert_eq!(d.take_urcs(), vec!["VOICE CALL: BEGIN"]);
     }
     proptest::proptest! {
         #[test] fn arbitrary_bytes_never_panic(chunks in proptest::collection::vec(proptest::collection::vec(any::<u8>(), 0..64), 0..30)) {

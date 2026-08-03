@@ -20,8 +20,7 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const SMS_SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const INITIALIZATION_COMMANDS: &[&str] = &["AT+CMEE=2", "AT+CVHU=0", "AT+CMGF=1"];
-const OPTIONAL_INITIALIZATION_COMMANDS: &[&str] =
-    &["AT+CSSN=1,1", "AT+CLCC=1", "AT+CNMI=2,1,0,1,0", "AT+CSDH=1"];
+const OPTIONAL_INITIALIZATION_COMMANDS: &[&str] = &["AT+CLCC=1", "AT+CNMI=2,1,0,1,0", "AT+CSDH=1"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PortCandidate {
@@ -466,7 +465,7 @@ mod tests {
         );
         assert_eq!(
             OPTIONAL_INITIALIZATION_COMMANDS,
-            ["AT+CSSN=1,1", "AT+CLCC=1", "AT+CNMI=2,1,0,1,0", "AT+CSDH=1"]
+            ["AT+CLCC=1", "AT+CNMI=2,1,0,1,0", "AT+CSDH=1"]
         );
     }
 

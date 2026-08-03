@@ -41,13 +41,14 @@ enum ModemState { MODEM_STATE_UNSPECIFIED = 0; DISCONNECTED_STATE = 1; PORT_BUSY
 message Port { string name = 1; uint32 vid = 2; uint32 pid = 3; string label = 4; bool available = 5; bool dedicated_at = 6; }
 message PortList { repeated Port ports = 1; }
 message Settings {
+  reserved 13;
+  reserved "voicemail_guard_seconds";
   uint32 usb_vid = 1; uint32 usb_pid = 2; string port_override = 3;
   uint32 baud = 4; uint32 call_timeout_seconds = 5;
   uint32 upload_pacing_ms = 6; uint32 max_audio_bytes = 7;
   string ussd_code = 8; uint32 ussd_timeout_seconds = 9;
   string currency = 10; double low_balance_threshold = 11;
   string balance_regex = 12;
-  uint32 voicemail_guard_seconds = 13;
 }
 message UpdateSettingsRequest { Settings settings = 1; }
 message SendSmsRequest { string destination = 1; string body = 2; }
@@ -58,9 +59,18 @@ message Operation { string id = 1; string state = 2; }
 message ListRequest { uint32 limit = 1; string cursor = 2; }
 message Sms { string id = 1; string direction = 2; string peer = 3; string body = 4; string state = 5; int64 created_at_ms = 6; string message_reference = 7; string cause = 8; }
 message SmsList { repeated Sms records = 1; string next_cursor = 2; }
-enum AnswerClassification { ANSWER_CLASSIFICATION_UNKNOWN = 0; INFERRED_HUMAN = 1; FORWARDED = 2; NO_ANSWER = 3; }
-enum EndReason { END_REASON_NONE = 0; LOCAL_HANG_UP = 1; REMOTE_OR_NETWORK_HANG_UP = 2; BUSY_END = 3; NETWORK_NO_ANSWER = 4; ALERT_TIMEOUT = 5; MODEM_LOST = 6; CALL_ERROR = 7; }
-message Call { string id = 1; string peer = 2; string state = 3; int64 created_at_ms = 4; string error = 5; uint32 duration_seconds = 6; string audio_id = 7; AnswerClassification answer_classification = 8; EndReason end_reason = 9; bool forwarding_notification_seen = 10; int64 connected_at_ms = 11; int64 ended_at_ms = 12; }
+enum AnswerClassification {
+  reserved 1, 2, 3;
+  reserved "INFERRED_HUMAN", "FORWARDED", "NO_ANSWER";
+  ANSWER_CLASSIFICATION_UNKNOWN = 0; ANSWERED = 4; NOT_ANSWERED = 5;
+}
+enum EndReason {
+  reserved 2, 4, 5;
+  reserved "REMOTE_OR_NETWORK_HANG_UP", "NETWORK_NO_ANSWER", "ALERT_TIMEOUT";
+  END_REASON_NONE = 0; LOCAL_HANG_UP = 1; BUSY_END = 3; MODEM_LOST = 6; CALL_ERROR = 7;
+  REMOTE_HANG_UP = 8; NO_ANSWER_END = 9; UNREACHABLE = 10; NETWORK_ERROR = 11; SIGNALING_TIMEOUT = 12;
+}
+message Call { reserved 10; reserved "forwarding_notification_seen"; string id = 1; string peer = 2; string state = 3; int64 created_at_ms = 4; string error = 5; uint32 duration_seconds = 6; string audio_id = 7; AnswerClassification answer_classification = 8; EndReason end_reason = 9; int64 connected_at_ms = 11; int64 ended_at_ms = 12; string release_cause = 13; }
 message CallList { repeated Call records = 1; string next_cursor = 2; }
 message BalanceCheck { string id = 1; string raw = 2; double value = 3; string currency = 4; int64 created_at_ms = 5; bool parsed = 6; string error = 7; }
 message BalanceList { repeated BalanceCheck records = 1; string next_cursor = 2; }
@@ -75,6 +85,6 @@ message Event {
 }
 message ModemStateEvent { string state = 1; string port = 2; string guidance = 3; }
 message SmsEvent { string record_id = 1; string state = 2; string cause = 3; }
-message CallEvent { string record_id = 1; string state = 2; string cause = 3; AnswerClassification answer_classification = 4; EndReason end_reason = 5; bool forwarding_notification_seen = 6; int64 connected_at_ms = 7; int64 ended_at_ms = 8; }
+message CallEvent { reserved 6; reserved "forwarding_notification_seen"; string record_id = 1; string state = 2; string cause = 3; AnswerClassification answer_classification = 4; EndReason end_reason = 5; int64 connected_at_ms = 7; int64 ended_at_ms = 8; string release_cause = 9; }
 message BalanceWarningEvent { string record_id = 1; double value = 2; string currency = 3; double threshold = 4; }
 message OperationFailureEvent { string operation_id = 1; ErrorCode code = 2; string message = 3; }

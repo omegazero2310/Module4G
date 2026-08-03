@@ -8,8 +8,6 @@ pub struct Settings {
     pub port_override: Option<String>,
     pub baud: u32,
     pub call_timeout_seconds: u32,
-    #[serde(default = "default_voicemail_guard_seconds")]
-    pub voicemail_guard_seconds: u32,
     pub upload_pacing_ms: u32,
     pub max_audio_bytes: usize,
     pub ussd_code: String,
@@ -27,7 +25,6 @@ impl Default for Settings {
             port_override: None,
             baud: 115_200,
             call_timeout_seconds: 90,
-            voicemail_guard_seconds: default_voicemail_guard_seconds(),
             upload_pacing_ms: 10,
             max_audio_bytes: 200 * 1024,
             ussd_code: "*101#".into(),
@@ -66,13 +63,6 @@ impl Settings {
         }
         if self.ussd_timeout_seconds == 0 || self.call_timeout_seconds == 0 {
             return Err(ModemError::Validation("timeouts must be positive".into()));
-        }
-        if !(5..=60).contains(&self.voicemail_guard_seconds)
-            || self.voicemail_guard_seconds >= self.call_timeout_seconds
-        {
-            return Err(ModemError::Validation(
-                "voicemail guard must be 5 to 60 seconds and below the call timeout".into(),
-            ));
         }
         if self.call_timeout_seconds > 600 || self.ussd_timeout_seconds > 300 {
             return Err(ModemError::Validation(
@@ -115,10 +105,6 @@ impl Settings {
     }
 }
 
-const fn default_voicemail_guard_seconds() -> u32 {
-    15
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,5 +118,17 @@ mod tests {
         settings.port_override = Some("COM6".into());
         settings.low_balance_threshold = f64::NAN;
         assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn old_voicemail_setting_is_ignored_and_not_serialized() {
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        value["voicemail_guard_seconds"] = 15.into();
+        let settings: Settings = serde_json::from_value(value).unwrap();
+        assert!(
+            !serde_json::to_string(&settings)
+                .unwrap()
+                .contains("voicemail_guard_seconds")
+        );
     }
 }

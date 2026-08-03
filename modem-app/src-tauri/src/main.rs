@@ -100,7 +100,6 @@ struct Settings {
     port_override: String,
     baud: u32,
     call_timeout_seconds: u32,
-    voicemail_guard_seconds: u32,
     upload_pacing_ms: u32,
     max_audio_bytes: usize,
     ussd_code: String,
@@ -118,7 +117,6 @@ impl From<CoreSettings> for Settings {
             port_override: value.port_override.unwrap_or_default(),
             baud: value.baud,
             call_timeout_seconds: value.call_timeout_seconds,
-            voicemail_guard_seconds: value.voicemail_guard_seconds,
             upload_pacing_ms: value.upload_pacing_ms,
             max_audio_bytes: value.max_audio_bytes,
             ussd_code: value.ussd_code,
@@ -138,7 +136,6 @@ impl From<Settings> for CoreSettings {
                 .then(|| value.port_override.trim().to_owned()),
             baud: value.baud,
             call_timeout_seconds: value.call_timeout_seconds,
-            voicemail_guard_seconds: value.voicemail_guard_seconds,
             upload_pacing_ms: value.upload_pacing_ms,
             max_audio_bytes: value.max_audio_bytes,
             ussd_code: value.ussd_code,
@@ -162,6 +159,9 @@ struct Record {
     answer_classification: String,
     end_reason: String,
     alerting_at_ms: u64,
+    release_cause: String,
+    #[serde(skip)]
+    voice_begin_seen: bool,
 }
 
 struct AppState {
@@ -353,6 +353,8 @@ async fn send_sms(
         answer_classification: String::new(),
         end_reason: String::new(),
         alerting_at_ms: 0,
+        release_cause: String::new(),
+        voice_begin_seen: false,
     };
     state
         .sms
@@ -398,6 +400,8 @@ async fn make_call(
         answer_classification: "unknown".into(),
         end_reason: "none".into(),
         alerting_at_ms: 0,
+        release_cause: String::new(),
+        voice_begin_seen: false,
     };
     state
         .calls
@@ -428,6 +432,11 @@ async fn hang_up(state: tauri::State<'_, AppState>) -> Result<(), String> {
         call.state = "ended".into();
         call.detail = "Local hang-up".into();
         call.end_reason = "Local hang-up".into();
+        call.answer_classification = if call.voice_begin_seen {
+            "Answered".into()
+        } else {
+            "Unknown".into()
+        };
     }
     Ok(())
 }
@@ -437,30 +446,103 @@ async fn hang_up(_state: tauri::State<'_, AppState>) -> Result<(), String> {
     Err("Calls are available only on Windows.".into())
 }
 fn is_live_call(state: &str) -> bool {
-    matches!(state, "dialing" | "ringing" | "connected")
+    matches!(state, "dialing" | "ringing" | "active")
 }
 
-fn call_state(response: &str) -> Option<&'static str> {
-    if response.contains("NO ANSWER") {
-        return Some("no answer");
+fn end_reason_label(reason: modemd::call::EndReason) -> &'static str {
+    use modemd::call::EndReason::*;
+    match reason {
+        None => "None",
+        LocalHangUp => "Local hang-up",
+        RemoteHangUp => "Remote hang-up",
+        Busy => "Busy",
+        NoAnswer => "No answer",
+        Unreachable => "Unreachable / cannot connect",
+        NetworkError => "Network error",
+        SignalingTimeout => "Signaling timeout",
+        ModemLost => "Modem lost",
+        CallError => "Call error",
     }
-    if response.contains("BUSY") {
-        return Some("busy");
+}
+
+/// Applies all events from one poll as a batch. Explicit terminal result codes
+/// take precedence even when a generic END/NO CARRIER occurs in the same read.
+fn apply_call_response(call: &mut Record, response: &str) -> bool {
+    let lines: Vec<_> = response.split(" | ").map(str::trim).collect();
+    let explicit = if lines.contains(&"BUSY") {
+        Some(("Busy", "Busy"))
+    } else if lines.contains(&"NO ANSWER") {
+        Some(("No answer", "No answer"))
+    } else {
+        None
+    };
+    let mut needs_ceer = false;
+    for line in lines {
+        if line == "VOICE CALL: BEGIN" || line == "VOICE CALL:BEGIN" {
+            call.voice_begin_seen = true;
+            call.answer_classification = "Answered".into();
+            call.state = "active".into();
+        } else if line.starts_with("VOICE CALL: END") || line.starts_with("VOICE CALL:END") {
+            needs_ceer = true;
+            call.state = "ended".into();
+            if !call.voice_begin_seen {
+                call.answer_classification = "Not answered".into();
+                call.end_reason = "No answer".into();
+            } else {
+                call.end_reason = "Remote hang-up".into();
+            }
+        } else if line == "NO CARRIER" {
+            needs_ceer = true;
+            call.state = "ended".into();
+        } else if let Some(event) = modemd::call::parse_urc(line)
+            && let modemd::call::CallUrc::Clcc {
+                direction: 0,
+                state,
+            } = event
+        {
+            call.state = match state {
+                2 => "dialing",
+                3 => "ringing",
+                0 | 4 | 5 => "active",
+                _ => call.state.as_str(),
+            }
+            .into();
+        }
     }
-    if response.contains("NO CARRIER") {
-        return Some("ended");
+    if let Some((state, reason)) = explicit {
+        call.state = "ended".into();
+        call.answer_classification = "Not answered".into();
+        call.end_reason = reason.into();
+        call.detail = state.into();
+    } else {
+        call.detail = response.into();
     }
-    let line = response
+    needs_ceer
+}
+
+fn apply_release_cause(call: &mut Record, response: &str) {
+    let cause = response
         .split(" | ")
-        .find(|line| line.starts_with("+CLCC:"))?;
-    match line.split(',').nth(2)?.trim() {
-        "0" => Some("connected"),
-        "2" => Some("dialing"),
-        "3" => Some("ringing"),
-        "4" | "5" => Some("connected"),
-        "6" => Some("ended"),
-        _ => None,
+        .find(|line| line.trim().starts_with("+CEER:"))
+        .unwrap_or(response)
+        .trim()
+        .trim_start_matches("+CEER:")
+        .trim();
+    let cause = modemd::call::sanitize_cause(cause);
+    call.release_cause = cause.clone();
+    if matches!(
+        call.end_reason.as_str(),
+        "Busy" | "No answer" | "Local hang-up"
+    ) {
+        return;
     }
+    let reason = modemd::call::classify_ceer(&cause, call.voice_begin_seen);
+    call.end_reason = end_reason_label(reason).into();
+    call.answer_classification = if call.voice_begin_seen {
+        "Answered".into()
+    } else {
+        "Not answered".into()
+    };
 }
 
 #[cfg(windows)]
@@ -480,53 +562,34 @@ async fn list_calls(state: tauri::State<'_, AppState>) -> Result<Vec<Record>, St
             .map_err(|_| "Settings lock failed")?
             .clone();
         let current_ms = now_ms();
-        let (alert_timeout, overall_timeout) = {
-            let mut alert_timeout = false;
+        let (needs_ceer, overall_timeout) = {
+            let mut needs_ceer = false;
             let mut overall_timeout = false;
             let mut calls = state.calls.lock().map_err(|_| "Call history lock failed")?;
             if let Some(call) = calls.iter_mut().find(|call| is_live_call(&call.state)) {
-                if let Some(next) = call_state(&response) {
-                    call.state = next.into();
-                    call.detail = response;
-                    match next {
-                        "connected" => call.answer_classification = "Answered (inferred)".into(),
-                        "ringing" => {
-                            if call.alerting_at_ms == 0 {
-                                call.alerting_at_ms = current_ms;
-                            }
-                        }
-                        "no answer" => {
-                            call.answer_classification = "No answer".into();
-                            call.end_reason = "Network no-answer".into();
-                        }
-                        "busy" => call.end_reason = "Busy".into(),
-                        "ended" => call.end_reason = "Remote or network hang-up".into(),
-                        _ => {}
-                    }
-                }
+                needs_ceer = apply_call_response(call, &response);
                 if is_live_call(&call.state)
-                    && call.alerting_at_ms != 0
-                    && current_ms.saturating_sub(call.alerting_at_ms)
-                        >= u64::from(settings.voicemail_guard_seconds) * 1_000
-                {
-                    call.state = "ended".into();
-                    call.detail = "Local alerting deadline reached".into();
-                    call.answer_classification = "No answer".into();
-                    call.end_reason = "Alert timeout".into();
-                    alert_timeout = true;
-                } else if is_live_call(&call.state)
                     && current_ms.saturating_sub(call.created_at_ms)
                         >= u64::from(settings.call_timeout_seconds) * 1_000
                 {
                     call.state = "ended".into();
-                    call.detail = "Overall call safety timeout reached".into();
-                    call.end_reason = "Error".into();
+                    call.detail =
+                        "No terminal call signaling was received before the safety timeout".into();
+                    call.answer_classification = "Unknown".into();
+                    call.end_reason = "Signaling timeout".into();
                     overall_timeout = true;
                 }
             }
-            (alert_timeout, overall_timeout)
+            (needs_ceer, overall_timeout)
         };
-        if alert_timeout || overall_timeout {
+        if needs_ceer {
+            let cause = ensure_ok(request_line("CALLCAUSE").await?)?;
+            let mut calls = state.calls.lock().map_err(|_| "Call history lock failed")?;
+            if let Some(call) = calls.first_mut().filter(|call| call.state == "ended") {
+                apply_release_cause(call, &cause);
+            }
+        }
+        if overall_timeout {
             ensure_ok(request_line("HANGUP").await?)?;
         }
     }
@@ -553,15 +616,46 @@ mod tests {
 
     #[test]
     fn parses_call_progress_and_terminal_results() {
-        assert_eq!(call_state("+CLCC: 1,0,3,0,0"), Some("ringing"));
-        assert_eq!(call_state("+CLCC: 1,0,0,0,0"), Some("connected"));
-        assert_eq!(call_state("NO ANSWER"), Some("no answer"));
-        assert_eq!(call_state("BUSY"), Some("busy"));
-        assert_eq!(
-            call_state("+CLCC: 1,0,2,0,0 | VOICE CALL: END | NO CARRIER"),
-            Some("ended")
-        );
-        assert_eq!(call_state(""), None);
+        let mut call = test_call();
+        assert!(!apply_call_response(&mut call, "+CLCC: 1,0,3,0,0"));
+        assert_eq!(call.state, "ringing");
+        apply_call_response(&mut call, "+CLCC: 1,0,0,0,0");
+        assert_eq!(call.answer_classification, "unknown");
+        assert!(apply_call_response(
+            &mut call,
+            "VOICE CALL: BEGIN | VOICE CALL: END | NO CARRIER"
+        ));
+        assert_eq!(call.answer_classification, "Answered");
+        assert_eq!(call.end_reason, "Remote hang-up");
+    }
+
+    fn test_call() -> Record {
+        Record {
+            id: "1".into(),
+            peer: String::new(),
+            body: String::new(),
+            state: "dialing".into(),
+            detail: String::new(),
+            created_at_ms: 0,
+            answer_classification: "unknown".into(),
+            end_reason: "none".into(),
+            alerting_at_ms: 0,
+            release_cause: String::new(),
+            voice_begin_seen: false,
+        }
+    }
+
+    #[test]
+    fn explicit_result_overrides_generic_terminal_in_same_batch() {
+        let mut call = test_call();
+        assert!(apply_call_response(
+            &mut call,
+            "VOICE CALL: END | NO CARRIER | BUSY"
+        ));
+        assert_eq!(call.answer_classification, "Not answered");
+        assert_eq!(call.end_reason, "Busy");
+        apply_release_cause(&mut call, "+CEER: 16 Normal call clearing");
+        assert_eq!(call.end_reason, "Busy");
     }
 
     #[test]
@@ -603,6 +697,8 @@ async fn check_balance(state: tauri::State<'_, AppState>) -> Result<Record, Stri
         answer_classification: String::new(),
         end_reason: String::new(),
         alerting_at_ms: 0,
+        release_cause: String::new(),
+        voice_begin_seen: false,
     };
     state
         .balances

@@ -1,12 +1,24 @@
 #[cfg(windows)]
 mod windows_sim {
     use std::io;
+    use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::windows::named_pipe::ServerOptions;
 
     const PIPE: &str = r"\\.\pipe\a7670-modemd-v1";
 
-    fn response(command: &str) -> &'static str {
+    #[derive(Clone, Copy, Default)]
+    enum CallScenario {
+        #[default]
+        Answered,
+        NoAnswer,
+        Busy,
+        Unreachable,
+        NetworkError,
+        MissingTerminal,
+    }
+
+    fn response(command: &str, scenario: &mut CallScenario) -> &'static str {
         let command = command.trim();
         if command.starts_with("SMS|") {
             return "+CMGS: 42\r\nOK\n";
@@ -17,11 +29,37 @@ mod windows_sim {
         if command.starts_with("USSD|") {
             return "+CUSD: 0,\"Balance 125.50 THB\",15\r\nOK\n";
         }
-        if command.starts_with("DIAL|") || command == "HANGUP" {
+        if let Some(number) = command.strip_prefix("DIAL|") {
+            *scenario = match &number[number.len().saturating_sub(2)..] {
+                "02" => CallScenario::NoAnswer,
+                "03" => CallScenario::Busy,
+                "04" => CallScenario::Unreachable,
+                "05" => CallScenario::NetworkError,
+                "06" => CallScenario::MissingTerminal,
+                _ => CallScenario::Answered,
+            };
             return "OK\n";
         }
+        if command == "HANGUP" {
+            return "OK\n";
+        }
+        if command == "CALLCAUSE" {
+            return match scenario {
+                CallScenario::Unreachable => "+CEER: 20 Subscriber absent\n",
+                CallScenario::NetworkError => "+CEER: 34 No circuit/channel available\n",
+                _ => "+CEER: 16 Normal call clearing\n",
+            };
+        }
         if command == "CALLSTATUS" {
-            return "+CLCC: 1,0,3,0,0\r\nOK\n";
+            return match scenario {
+                CallScenario::Answered => {
+                    "+CLCC: 1,0,0,0,0 | VOICE CALL: BEGIN | VOICE CALL: END | NO CARRIER\n"
+                }
+                CallScenario::NoAnswer => "NO ANSWER | VOICE CALL: END | NO CARRIER\n",
+                CallScenario::Busy => "BUSY | NO CARRIER\n",
+                CallScenario::Unreachable | CallScenario::NetworkError => "NO CARRIER\n",
+                CallScenario::MissingTerminal => "+CLCC: 1,0,2,0,0\n",
+            };
         }
         match command {
             "STATUS" => "STATUS\t0.1.0-sim\tReady\tSIMULATED\tREADY\tRegistered\t20\n",
@@ -38,6 +76,7 @@ mod windows_sim {
 
     async fn serve_connection(
         server: tokio::net::windows::named_pipe::NamedPipeServer,
+        scenario: Arc<Mutex<CallScenario>>,
     ) -> io::Result<()> {
         server.connect().await?;
         let mut line = String::new();
@@ -45,7 +84,13 @@ mod windows_sim {
         while stream.read_line(&mut line).await? != 0 {
             stream
                 .get_mut()
-                .write_all(response(&line).as_bytes())
+                .write_all(
+                    response(
+                        &line,
+                        &mut scenario.lock().unwrap_or_else(|lock| lock.into_inner()),
+                    )
+                    .as_bytes(),
+                )
                 .await?;
             stream.get_mut().flush().await?;
             line.clear();
@@ -55,9 +100,10 @@ mod windows_sim {
 
     pub async fn run() -> io::Result<()> {
         eprintln!("modem-sim listening on {PIPE}");
+        let scenario = Arc::new(Mutex::new(CallScenario::default()));
         loop {
             let server = ServerOptions::new().create(PIPE)?;
-            if let Err(error) = serve_connection(server).await {
+            if let Err(error) = serve_connection(server, Arc::clone(&scenario)).await {
                 eprintln!("simulator client error: {error}");
             }
         }
