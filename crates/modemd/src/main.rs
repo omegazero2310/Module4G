@@ -262,9 +262,7 @@ mod windows_host {
                 }
             } else if let Some(number) = request.strip_prefix("DIAL|") {
                 match modemd::sms::normalize_number(number) {
-                    Ok(number) => {
-                        run_actor(&command_tx, format!("ATD{number};"), None, false).await
-                    }
+                    Ok(number) => dial_with_release_retry(&command_tx, &number).await,
                     Err(error) => format!("ERROR: {error}\n"),
                 }
             } else if request == "HANGUP" {
@@ -332,6 +330,29 @@ mod windows_host {
         }
     }
 
+    async fn dial_with_release_retry(
+        command_tx: &mpsc::Sender<hardware::AtRequest>,
+        number: &str,
+    ) -> String {
+        const MAX_ATTEMPTS: usize = 5;
+        const RELEASE_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+        let command = format!("ATD{number};");
+        for attempt in 1..=MAX_ATTEMPTS {
+            let response = run_actor(command_tx, command.clone(), None, false).await;
+            if !is_transient_call_release_error(&response) || attempt == MAX_ATTEMPTS {
+                return response;
+            }
+            tokio::time::sleep(RELEASE_RETRY_DELAY).await;
+        }
+        unreachable!("the bounded dial loop always returns")
+    }
+
+    fn is_transient_call_release_error(response: &str) -> bool {
+        let response = response.to_ascii_lowercase();
+        response.contains("+cme error:") && response.contains("operation not allowed")
+    }
+
     async fn check_viettel_balance(command_tx: &mpsc::Sender<hardware::AtRequest>) -> String {
         let submitted = run_actor(
             command_tx,
@@ -377,14 +398,40 @@ mod windows_host {
         }
 
         let body = body.join("\n");
-        let dcs = csv_field(parts[header], 8).and_then(|value| value.trim().parse::<u8>().ok());
+        let dcs = csv_field(parts[header], 8).and_then(parse_dcs);
+        let compact_hex: String = body
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        let decoded = decode_ucs2_hex(&compact_hex);
         let is_ucs2 = dcs.is_some_and(dcs_uses_ucs2)
-            || (dcs.is_none() && body.starts_with("00") && body.len() % 4 == 0);
-        if is_ucs2 {
-            decode_ucs2_hex(&body)
+            || (dcs.is_none() && decoded.as_deref().is_some_and(looks_like_text));
+        Some(if is_ucs2 {
+            // A malformed or truncated UCS2 response should still be visible to the
+            // caller instead of making the already-read SMS disappear.
+            decoded.unwrap_or(body)
         } else {
-            Some(body)
-        }
+            body
+        })
+    }
+
+    fn parse_dcs(value: &str) -> Option<u8> {
+        let value = value.trim().trim_matches('"');
+        value.parse().ok().or_else(|| {
+            value
+                .strip_prefix("0x")
+                .or_else(|| value.strip_prefix("0X"))
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+        })
+    }
+
+    fn looks_like_text(value: &str) -> bool {
+        let value = value.strip_prefix('\u{feff}').unwrap_or(value);
+        !value.is_empty()
+            && value.chars().any(|character| character.is_alphabetic())
+            && value
+                .chars()
+                .all(|character| !character.is_control() || matches!(character, '\n' | '\r' | '\t'))
     }
 
     fn dcs_uses_ucs2(dcs: u8) -> bool {
@@ -425,6 +472,12 @@ mod windows_host {
         char::decode_utf16(units)
             .collect::<Result<String, _>>()
             .ok()
+            .map(|decoded| {
+                decoded
+                    .strip_prefix('\u{feff}')
+                    .unwrap_or(&decoded)
+                    .to_owned()
+            })
     }
 
     fn decode_hex(value: &str) -> Option<Vec<u8>> {
@@ -439,7 +492,24 @@ mod windows_host {
 
     #[cfg(test)]
     mod tests {
-        use super::viettel_balance_message;
+        use super::{is_transient_call_release_error, viettel_balance_message};
+
+        #[test]
+        fn retries_dial_when_previous_call_is_still_releasing() {
+            assert!(is_transient_call_release_error(
+                "ERROR: modem rejected command: +CME ERROR: operation not allowed\n"
+            ));
+        }
+
+        #[test]
+        fn does_not_retry_other_dial_failures() {
+            assert!(!is_transient_call_release_error(
+                "ERROR: modem rejected command: +CME ERROR: SIM not inserted\n"
+            ));
+            assert!(!is_transient_call_release_error(
+                "ERROR: command timed out\n"
+            ));
+        }
 
         #[test]
         fn extracts_viettel_balance_sms_from_191() {
@@ -472,6 +542,27 @@ mod windows_host {
         fn does_not_decode_gsm_7_bit_hex_looking_text() {
             let response = "+CMGL: 10,\"REC UNREAD\",\"191\",\"\",\"26/08/03,10:00:00+28\",129,0,0,0,\"+84000000000\",145,4 | 1234 | OK";
             assert_eq!(viettel_balance_message(response).unwrap(), "1234");
+        }
+
+        #[test]
+        fn decodes_multiline_ucs2_without_extended_header() {
+            let response = "+CMGL: 11,\"REC UNREAD\",\"191\",\"\",\"26/08/03,10:00:00+28\" | FEFF00540068007500EA002000620061006F003A | 002000310030003000300030003000200056004E0044 | OK";
+            assert_eq!(
+                viettel_balance_message(response).unwrap(),
+                "Thuê bao: 100000 VND"
+            );
+        }
+
+        #[test]
+        fn accepts_quoted_hex_dcs() {
+            let response = "+CMGL: 12,\"REC UNREAD\",\"191\",\"\",\"26/08/03,10:00:00+28\",129,0,0,\"0x08\" | 00540068007500EA | OK";
+            assert_eq!(viettel_balance_message(response).unwrap(), "Thuê");
+        }
+
+        #[test]
+        fn preserves_malformed_ucs2_instead_of_losing_message() {
+            let response = "+CMGL: 13,\"REC UNREAD\",\"191\",\"\",\"26/08/03,10:00:00+28\",129,0,0,8 | 0054006 | OK";
+            assert_eq!(viettel_balance_message(response).unwrap(), "0054006");
         }
     }
 }
