@@ -21,6 +21,8 @@ pub enum ModemError {
     SimUnavailable,
     #[error("network unavailable")]
     NetworkUnavailable,
+    #[error("modem rejected command: {0}")]
+    CommandRejected(String),
     #[error("persistence failed: {0}")]
     Persistence(String),
 }
@@ -32,7 +34,11 @@ impl From<ModemError> for tonic::Status {
             ModemError::Busy => tonic::Status::resource_exhausted(error.to_string()),
             ModemError::Disconnected => tonic::Status::unavailable(error.to_string()),
             ModemError::Timeout => tonic::Status::deadline_exceeded(error.to_string()),
-            ModemError::SimUnavailable | ModemError::NetworkUnavailable => tonic::Status::failed_precondition(error.to_string()),
+            ModemError::SimUnavailable
+            | ModemError::NetworkUnavailable
+            | ModemError::CommandRejected(_) => {
+                tonic::Status::failed_precondition(error.to_string())
+            }
             ModemError::Persistence(_) => tonic::Status::internal(error.to_string()),
         }
     }

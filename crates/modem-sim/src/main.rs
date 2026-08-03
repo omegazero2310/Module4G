@@ -7,11 +7,25 @@ mod windows_sim {
     const PIPE: &str = r"\\.\pipe\a7670-modemd-v1";
 
     fn response(command: &str) -> &'static str {
-        match command.trim() {
+        let command = command.trim();
+        if command.starts_with("SMS|") {
+            return "+CMGS: 42\r\nOK\n";
+        }
+        if command.starts_with("USSD|") {
+            return "+CUSD: 0,\"Balance 125.50 THB\",15\r\nOK\n";
+        }
+        if command.starts_with("DIAL|") || command == "HANGUP" {
+            return "OK\n";
+        }
+        if command == "CALLSTATUS" {
+            return "+CLCC: 1,0,3,0,0\r\nOK\n";
+        }
+        match command {
             "STATUS" => "STATUS\t0.1.0-sim\tReady\tSIMULATED\tREADY\tRegistered\t20\n",
             "AT" | "AT+CMEE=2" | "AT+CVHU=0" | "AT+CLCC=1" | "AT+CMGF=1" | "AT+CNMI=1,1,0,1,0" => {
                 "OK\n"
             }
+            "ATI" => "SIMCOM_Ltd\r\nSIMCOM_SIM7600G-H\r\nRevision: A7670M7_V1.11\r\nOK\n",
             "AT+CSQ" => "+CSQ: 20,99\r\nOK\n",
             "AT+CPIN?" => "+CPIN: READY\r\nOK\n",
             "AT+CREG?" => "+CREG: 0,1\r\nOK\n",

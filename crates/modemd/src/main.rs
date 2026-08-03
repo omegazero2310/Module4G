@@ -128,21 +128,27 @@ mod windows_host {
         let monitor_state = Arc::clone(&device_state);
         let monitor_stop = Arc::new(AtomicBool::new(false));
         let monitor_stop_task = Arc::clone(&monitor_stop);
+        let (command_tx, command_rx) = mpsc::channel();
         let monitor = tokio::task::spawn_blocking(move || {
-            hardware::monitor(Settings::default(), monitor_stop_task, |state| {
-                match &state {
-                    hardware::HardwareState::Ready { port_name } => {
-                        eprintln!("modem connected and initialized on {port_name}")
+            hardware::monitor_with_commands(
+                Settings::default(),
+                monitor_stop_task,
+                |state| {
+                    match &state {
+                        hardware::HardwareState::Ready { port_name } => {
+                            eprintln!("modem connected and initialized on {port_name}")
+                        }
+                        hardware::HardwareState::PortBusy { port_name } => {
+                            eprintln!("modem detected on {port_name}, but the port is busy")
+                        }
+                        hardware::HardwareState::Disconnected => eprintln!("modem disconnected"),
                     }
-                    hardware::HardwareState::PortBusy { port_name } => {
-                        eprintln!("modem detected on {port_name}, but the port is busy")
-                    }
-                    hardware::HardwareState::Disconnected => eprintln!("modem disconnected"),
-                }
-                *monitor_state
-                    .write()
-                    .unwrap_or_else(|lock| lock.into_inner()) = state;
-            });
+                    *monitor_state
+                        .write()
+                        .unwrap_or_else(|lock| lock.into_inner()) = state;
+                },
+                command_rx,
+            );
         });
         tokio::pin!(stop);
         loop {
@@ -160,7 +166,7 @@ mod windows_host {
                 },
                 connected = server.connect() => {
                     connected?;
-                    tokio::spawn(handle_client(server, Arc::clone(&device_state)));
+                    tokio::spawn(handle_client(server, Arc::clone(&device_state), command_tx.clone()));
                 }
             }
         }
@@ -213,11 +219,13 @@ mod windows_host {
     async fn handle_client(
         server: tokio::net::windows::named_pipe::NamedPipeServer,
         device_state: Arc<RwLock<hardware::HardwareState>>,
+        command_tx: mpsc::Sender<hardware::AtRequest>,
     ) -> io::Result<()> {
         let mut stream = BufReader::new(server);
         let mut line = String::new();
         while stream.read_line(&mut line).await? != 0 {
-            let response = if line.trim() == "STATUS" {
+            let request = line.trim();
+            let response = if request == "STATUS" {
                 let state = device_state.read().unwrap_or_else(|lock| lock.into_inner());
                 let state = match &*state {
                     hardware::HardwareState::Ready { port_name } => format!("Ready\t{port_name}"),
@@ -227,14 +235,109 @@ mod windows_host {
                     hardware::HardwareState::Disconnected => "Disconnected\t".to_owned(),
                 };
                 format!("STATUS\t0.1.0\t{state}\tUNKNOWN\tNot registered\t0\n")
+            } else if let Some(rest) = request.strip_prefix("SMS|") {
+                let mut fields = rest.splitn(2, '|');
+                let destination = fields.next().unwrap_or_default();
+                let body = fields.next().and_then(decode_hex);
+                match (modemd::sms::normalize_number(destination), body) {
+                    (Ok(destination), Some(body)) => {
+                        run_actor(
+                            &command_tx,
+                            format!("AT+CMGS=\"{destination}\""),
+                            Some(body),
+                            false,
+                        )
+                        .await
+                    }
+                    (Err(error), _) => format!("ERROR: {error}\n"),
+                    (_, None) => "ERROR: invalid SMS payload\n".into(),
+                }
+            } else if let Some(code) = request.strip_prefix("USSD|") {
+                if code.is_empty() || code.len() > 64 {
+                    "ERROR: invalid USSD code\n".into()
+                } else {
+                    run_actor(&command_tx, format!("AT+CUSD=1,\"{code}\",15"), None, false).await
+                }
+            } else if let Some(number) = request.strip_prefix("DIAL|") {
+                match modemd::sms::normalize_number(number) {
+                    Ok(number) => {
+                        run_actor(&command_tx, format!("ATD{number};"), None, false).await
+                    }
+                    Err(error) => format!("ERROR: {error}\n"),
+                }
+            } else if request == "HANGUP" {
+                run_actor(&command_tx, "ATH".into(), None, false).await
+            } else if request == "CALLSTATUS" {
+                run_actor(&command_tx, "AT+CLCC".into(), None, false).await
+            } else if request.starts_with("AT") {
+                match modemd::at::validate_console(request, false) {
+                    Err(error) => format!("ERROR: {error}\n"),
+                    Ok(command) => {
+                        let (reply, response) = tokio::sync::oneshot::channel();
+                        if command_tx
+                            .send(hardware::AtRequest {
+                                command,
+                                payload: None,
+                                guarded: true,
+                                reply,
+                            })
+                            .is_err()
+                        {
+                            "ERROR: modem command actor unavailable\n".to_owned()
+                        } else {
+                            match tokio::time::timeout(Duration::from_secs(3), response).await {
+                                Ok(Ok(Ok(lines))) => format!("{}\n", lines.join("\r\n")),
+                                Ok(Ok(Err(error))) => format!("ERROR: {error}\n"),
+                                Ok(Err(_)) => "ERROR: modem command actor stopped\n".to_owned(),
+                                Err(_) => "ERROR: command timed out\n".to_owned(),
+                            }
+                        }
+                    }
+                }
             } else {
-                "ERROR\n".to_owned()
+                "ERROR: unsupported request\n".to_owned()
             };
             stream.get_mut().write_all(response.as_bytes()).await?;
             stream.get_mut().flush().await?;
             line.clear();
         }
         Ok(())
+    }
+
+    async fn run_actor(
+        command_tx: &mpsc::Sender<hardware::AtRequest>,
+        command: String,
+        payload: Option<Vec<u8>>,
+        guarded: bool,
+    ) -> String {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        if command_tx
+            .send(hardware::AtRequest {
+                command,
+                payload,
+                guarded,
+                reply,
+            })
+            .is_err()
+        {
+            return "ERROR: modem command actor unavailable\n".into();
+        }
+        match tokio::time::timeout(Duration::from_secs(35), response).await {
+            Ok(Ok(Ok(lines))) => format!("{}\n", lines.join(" | ")),
+            Ok(Ok(Err(error))) => format!("ERROR: {error}\n"),
+            Ok(Err(_)) => "ERROR: modem command actor stopped\n".into(),
+            Err(_) => "ERROR: command timed out\n".into(),
+        }
+    }
+
+    fn decode_hex(value: &str) -> Option<Vec<u8>> {
+        if value.len() % 2 != 0 {
+            return None;
+        }
+        (0..value.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&value[index..index + 2], 16).ok())
+            .collect()
     }
 }
 

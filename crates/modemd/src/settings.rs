@@ -39,12 +39,16 @@ impl Default for Settings {
 impl Settings {
     pub fn validate(&self) -> Result<(), ModemError> {
         if self.usb_vid == 0 || self.usb_pid == 0 {
-            return Err(ModemError::Validation("USB VID and PID must be non-zero".into()));
+            return Err(ModemError::Validation(
+                "USB VID and PID must be non-zero".into(),
+            ));
         }
         if let Some(port) = &self.port_override {
             let upper = port.trim().to_ascii_uppercase();
             if !upper.starts_with("COM") || upper[3..].parse::<u16>().is_err() {
-                return Err(ModemError::Validation("port override must look like COM6".into()));
+                return Err(ModemError::Validation(
+                    "port override must look like COM6".into(),
+                ));
             }
         }
         if !(1_200..=921_600).contains(&self.baud) {
@@ -61,22 +65,41 @@ impl Settings {
             return Err(ModemError::Validation("timeouts must be positive".into()));
         }
         if self.call_timeout_seconds > 600 || self.ussd_timeout_seconds > 300 {
-            return Err(ModemError::Validation("timeouts exceed the supported maximum".into()));
+            return Err(ModemError::Validation(
+                "timeouts exceed the supported maximum".into(),
+            ));
         }
         if self.upload_pacing_ms > 5_000 {
-            return Err(ModemError::Validation("upload pacing must not exceed 5000 ms".into()));
+            return Err(ModemError::Validation(
+                "upload pacing must not exceed 5000 ms".into(),
+            ));
         }
-        if self.ussd_code.is_empty() || self.ussd_code.len() > 64 || self.ussd_code.chars().any(char::is_control) {
-            return Err(ModemError::Validation("USSD code must contain 1 to 64 printable characters".into()));
+        if self.ussd_code.is_empty()
+            || self.ussd_code.len() > 64
+            || self.ussd_code.chars().any(char::is_control)
+        {
+            return Err(ModemError::Validation(
+                "USSD code must contain 1 to 64 printable characters".into(),
+            ));
         }
         if self.currency.len() > 12 || self.currency.chars().any(char::is_control) {
-            return Err(ModemError::Validation("currency must be at most 12 printable characters".into()));
+            return Err(ModemError::Validation(
+                "currency must be at most 12 printable characters".into(),
+            ));
         }
         if !self.low_balance_threshold.is_finite() || self.low_balance_threshold < 0.0 {
-            return Err(ModemError::Validation("low balance threshold must be a non-negative number".into()));
+            return Err(ModemError::Validation(
+                "low balance threshold must be a non-negative number".into(),
+            ));
         }
-        if self.balance_regex.as_ref().is_some_and(|value| value.len() > 512) {
-            return Err(ModemError::Validation("balance regex must be at most 512 characters".into()));
+        if self
+            .balance_regex
+            .as_ref()
+            .is_some_and(|value| value.len() > 512)
+        {
+            return Err(ModemError::Validation(
+                "balance regex must be at most 512 characters".into(),
+            ));
         }
         Ok(())
     }

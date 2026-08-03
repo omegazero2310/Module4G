@@ -9,6 +9,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     thread,
     time::{Duration, Instant},
@@ -16,6 +17,7 @@ use std::{
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+const SMS_SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const INITIALIZATION_COMMANDS: &[&str] = &["AT+CMEE=2", "AT+CVHU=0", "AT+CMGF=1"];
 const OPTIONAL_INITIALIZATION_COMMANDS: &[&str] = &["AT+CLCC=1", "AT+CNMI=2,1,0,1,0"];
@@ -64,6 +66,13 @@ pub enum HardwareState {
     Ready { port_name: String },
 }
 
+pub struct AtRequest {
+    pub command: String,
+    pub payload: Option<Vec<u8>>,
+    pub guarded: bool,
+    pub reply: tokio::sync::oneshot::Sender<Result<Vec<String>, ModemError>>,
+}
+
 impl InitializedModem {
     pub fn port(&mut self) -> &mut dyn SerialPort {
         self.port.as_mut()
@@ -84,11 +93,39 @@ impl InitializedModem {
 /// The returned serial handle stays owned by this loop until removal, ensuring
 /// no second process can claim the AT port between initialization and use.
 pub fn monitor(settings: Settings, stop: Arc<AtomicBool>, mut report: impl FnMut(HardwareState)) {
+    let (_sender, receiver) = mpsc::channel();
+    monitor_with_commands(settings, stop, &mut report, receiver);
+}
+
+/// Owns the serial port and executes guarded console requests sequentially.
+pub fn monitor_with_commands(
+    settings: Settings,
+    stop: Arc<AtomicBool>,
+    mut report: impl FnMut(HardwareState),
+    commands: mpsc::Receiver<AtRequest>,
+) {
     let mut modem: Option<InitializedModem> = None;
     let mut last_state: Option<HardwareState> = None;
     while !stop.load(Ordering::Relaxed) {
         if modem.as_ref().is_some_and(InitializedModem::is_present) {
-            thread::sleep(DEVICE_POLL_INTERVAL);
+            match commands.recv_timeout(Duration::from_millis(100)) {
+                Ok(request) => {
+                    let result = execute_command(
+                        modem.as_mut().expect("presence checked").port(),
+                        &request.command,
+                        request.payload.as_deref(),
+                        request.guarded,
+                        if request.payload.is_some() {
+                            SMS_SUBMIT_TIMEOUT
+                        } else {
+                            COMMAND_TIMEOUT
+                        },
+                    );
+                    let _ = request.reply.send(result);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => thread::sleep(DEVICE_POLL_INTERVAL),
+            }
             continue;
         }
 
@@ -110,6 +147,65 @@ pub fn monitor(settings: Settings, stop: Arc<AtomicBool>, mut report: impl FnMut
         }
         thread::sleep(DEVICE_POLL_INTERVAL);
     }
+}
+
+fn execute_command(
+    port: &mut dyn SerialPort,
+    command: &str,
+    payload: Option<&[u8]>,
+    guarded: bool,
+    timeout: Duration,
+) -> Result<Vec<String>, ModemError> {
+    if guarded {
+        crate::at::validate_console(command, false)?;
+    }
+    port.write_all(command.as_bytes())
+        .map_err(|_| ModemError::Disconnected)?;
+    port.write_all(b"\r")
+        .map_err(|_| ModemError::Disconnected)?;
+    port.flush().map_err(|_| ModemError::Disconnected)?;
+    let deadline = Instant::now() + timeout;
+    let mut framer = Framer::default();
+    let mut lines = Vec::new();
+    let mut buffer = [0_u8; 256];
+    while Instant::now() < deadline {
+        match port.read(&mut buffer) {
+            Ok(0) => {}
+            Ok(count) => {
+                for frame in framer.push(&buffer[..count]) {
+                    if let Frame::Line(line) = &frame {
+                        if line.eq_ignore_ascii_case(command) {
+                            continue;
+                        }
+                        if line == "OK" {
+                            return Ok(lines);
+                        }
+                        if line == "ERROR"
+                            || line.starts_with("+CME ERROR:")
+                            || line.starts_with("+CMS ERROR:")
+                        {
+                            return Err(ModemError::CommandRejected(line.clone()));
+                        }
+                        lines.push(line.clone());
+                    } else if matches!(frame, Frame::Prompt) {
+                        let Some(payload) = payload else {
+                            return Err(ModemError::Validation(
+                                "modem requested an unexpected payload".into(),
+                            ));
+                        };
+                        port.write_all(payload)
+                            .map_err(|_| ModemError::Disconnected)?;
+                        port.write_all(&[0x1a])
+                            .map_err(|_| ModemError::Disconnected)?;
+                        port.flush().map_err(|_| ModemError::Disconnected)?;
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => {}
+            Err(_) => return Err(ModemError::Disconnected),
+        }
+    }
+    Err(ModemError::Timeout)
 }
 
 fn publish_if_changed(

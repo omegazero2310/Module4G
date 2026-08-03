@@ -12,7 +12,9 @@ impl Store {
         Ok(store)
     }
 
-    pub fn memory() -> Result<Self, ModemError> { Self::open(":memory:") }
+    pub fn memory() -> Result<Self, ModemError> {
+        Self::open(":memory:")
+    }
 
     fn migrate(&self) -> Result<(), ModemError> {
         self.connection()?.execute_batch(
@@ -32,8 +34,14 @@ impl Store {
     }
 
     pub fn load_settings(&self) -> Result<Settings, ModemError> {
-        let json: Option<String> = self.connection()?.query_row("SELECT json FROM settings WHERE id=1", [], |row| row.get(0)).optional().map_err(db_error)?;
-        json.map(|value| serde_json::from_str(&value).map_err(db_error)).transpose().map(|value| value.unwrap_or_default())
+        let json: Option<String> = self
+            .connection()?
+            .query_row("SELECT json FROM settings WHERE id=1", [], |row| row.get(0))
+            .optional()
+            .map_err(db_error)?;
+        json.map(|value| serde_json::from_str(&value).map_err(db_error))
+            .transpose()
+            .map(|value| value.unwrap_or_default())
     }
 
     pub fn save_settings(&self, settings: &Settings, now_ms: i64) -> Result<(), ModemError> {
@@ -44,15 +52,23 @@ impl Store {
     }
 
     pub fn schema_version(&self) -> Result<i64, ModemError> {
-        self.connection()?.query_row("SELECT max(version) FROM schema_migrations", [], |row| row.get(0)).map_err(db_error)
+        self.connection()?
+            .query_row("SELECT max(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .map_err(db_error)
     }
 
     fn connection(&self) -> Result<std::sync::MutexGuard<'_, Connection>, ModemError> {
-        self.0.lock().map_err(|_| ModemError::Persistence("database lock poisoned".into()))
+        self.0
+            .lock()
+            .map_err(|_| ModemError::Persistence("database lock poisoned".into()))
     }
 }
 
-fn db_error(error: impl std::fmt::Display) -> ModemError { ModemError::Persistence(error.to_string()) }
+fn db_error(error: impl std::fmt::Display) -> ModemError {
+    ModemError::Persistence(error.to_string())
+}
 
 #[cfg(test)]
 mod tests {
