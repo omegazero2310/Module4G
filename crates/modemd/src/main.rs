@@ -1,7 +1,8 @@
 #[cfg(windows)]
 mod windows_host {
     use modemd::{
-        hardware,
+        call_workflow::CallManager,
+        hardware::{self, PayloadMode},
         settings::Settings,
         storage::{BalanceRecord, SmsRecord, Store},
     };
@@ -135,14 +136,24 @@ mod windows_host {
         std::fs::create_dir_all(&data_dir)?;
         let store =
             Arc::new(Store::open(data_dir.join("modemd.sqlite3")).map_err(io::Error::other)?);
+        let _ = store
+            .recover_interrupted_calls(now())
+            .map_err(io::Error::other)?;
+        let settings = Arc::new(RwLock::new(
+            store.load_settings().map_err(io::Error::other)?,
+        ));
         let device_state = Arc::new(RwLock::new(hardware::HardwareState::Disconnected));
         let monitor_state = Arc::clone(&device_state);
         let monitor_stop = Arc::new(AtomicBool::new(false));
         let monitor_stop_task = Arc::clone(&monitor_stop);
+        let monitor_settings = Arc::clone(&settings);
         let (command_tx, command_rx) = mpsc::channel();
         let monitor = tokio::task::spawn_blocking(move || {
             hardware::monitor_with_commands(
-                Settings::default(),
+                monitor_settings
+                    .read()
+                    .unwrap_or_else(|lock| lock.into_inner())
+                    .clone(),
                 monitor_stop_task,
                 |state| {
                     match &state {
@@ -161,6 +172,11 @@ mod windows_host {
                 command_rx,
             );
         });
+        let call_manager = Arc::new(CallManager::new(
+            command_tx.clone(),
+            Arc::clone(&store),
+            Arc::clone(&settings),
+        ));
         tokio::pin!(stop);
         loop {
             let security = PipeSecurity::new()?;
@@ -177,7 +193,7 @@ mod windows_host {
                 },
                 connected = server.connect() => {
                     connected?;
-                    tokio::spawn(handle_client(server, Arc::clone(&device_state), command_tx.clone(), Arc::clone(&store)));
+                    tokio::spawn(handle_client(server, Arc::clone(&device_state), command_tx.clone(), Arc::clone(&store), Arc::clone(&call_manager)));
                 }
             }
         }
@@ -232,13 +248,14 @@ mod windows_host {
         device_state: Arc<RwLock<hardware::HardwareState>>,
         command_tx: mpsc::Sender<hardware::AtRequest>,
         store: Arc<Store>,
+        call_manager: Arc<CallManager>,
     ) -> io::Result<()> {
         let mut stream = BufReader::new(server);
         let mut line = String::new();
         while stream.read_line(&mut line).await? != 0 {
             let request = line.trim();
             let response = if request.starts_with('{') {
-                handle_json(request, &command_tx, &store).await
+                handle_json(request, &command_tx, &store, &call_manager).await
             } else if request == "STATUS" {
                 let state = device_state.read().unwrap_or_else(|lock| lock.into_inner());
                 let state = match &*state {
@@ -295,6 +312,9 @@ mod windows_host {
                                 command,
                                 payload: None,
                                 guarded: true,
+                                payload_mode: PayloadMode::Sms,
+                                batch: Vec::new(),
+                                finalizer: None,
                                 reply,
                             })
                             .is_err()
@@ -324,6 +344,7 @@ mod windows_host {
         request: &str,
         tx: &mpsc::Sender<hardware::AtRequest>,
         store: &Store,
+        call_manager: &Arc<CallManager>,
     ) -> String {
         let value: serde_json::Value = match serde_json::from_str(request) {
             Ok(v) => v,
@@ -367,6 +388,39 @@ mod windows_host {
             "check_balance" => balance_json(tx, store)
                 .await
                 .map(|x| serde_json::to_value(x).unwrap()),
+            "get_current_audio" => call_manager
+                .current_audio()
+                .map(|audio| serde_json::to_value(audio).unwrap())
+                .map_err(|e| e.to_string()),
+            "upload_audio" => upload_audio_json(value, call_manager)
+                .await
+                .map(|audio| serde_json::to_value(audio).unwrap()),
+            "make_call" => make_call_json(value, call_manager)
+                .await
+                .map(|call| serde_json::to_value(call).unwrap()),
+            "hang_up" => call_manager
+                .hang_up()
+                .await
+                .map(|()| serde_json::Value::Null)
+                .map_err(|e| e.to_string()),
+            "list_calls" => call_manager
+                .list_calls(1000)
+                .map(|calls| serde_json::to_value(calls).unwrap())
+                .map_err(|e| e.to_string()),
+            "get_settings" => Ok(serde_json::to_value(call_manager.settings()).unwrap()),
+            "update_settings" => serde_json::from_value::<Settings>(
+                value
+                    .get("settings")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            )
+            .map_err(|_| "invalid settings payload".to_owned())
+            .and_then(|settings| {
+                call_manager
+                    .update_settings(settings)
+                    .map_err(|error| error.to_string())
+            })
+            .map(|settings| serde_json::to_value(settings).unwrap()),
             _ => Err("unknown JSON command".into()),
         };
         match result {
@@ -382,6 +436,50 @@ mod windows_host {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64
+    }
+
+    async fn upload_audio_json(
+        value: serde_json::Value,
+        manager: &CallManager,
+    ) -> Result<modemd::storage::UploadedAudioRecord, String> {
+        let name = value
+            .get("name")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_owned();
+        let data: Vec<u8> = serde_json::from_value(
+            value
+                .get("data")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        )
+        .map_err(|_| "invalid audio payload".to_owned())?;
+        manager
+            .upload_audio(name, data)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn make_call_json(
+        value: serde_json::Value,
+        manager: &Arc<CallManager>,
+    ) -> Result<modemd::storage::CallRecord, String> {
+        let destination = modemd::sms::normalize_number(
+            value
+                .get("destination")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default(),
+        )
+        .map_err(|e| e.to_string())?;
+        let audio_id = value
+            .get("audioId")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_owned();
+        manager
+            .make_call(destination, audio_id)
+            .await
+            .map_err(|e| e.to_string())
     }
     async fn send_sms_json(
         v: serde_json::Value,
@@ -420,6 +518,9 @@ mod windows_host {
             created_at_ms: now(),
             kind: "submitted".into(),
             source: "app".into(),
+            part_count: 1,
+            parts_received: 1,
+            multipart_complete: true,
             encoding: modemd::sms::validate_body(&body).unwrap_or("").into(),
             length: body.chars().count() as i32,
             ..Default::default()
@@ -437,6 +538,9 @@ mod windows_host {
             command,
             payload,
             guarded: false,
+            payload_mode: PayloadMode::Sms,
+            batch: Vec::new(),
+            finalizer: None,
             reply,
         })
         .map_err(|_| "modem command actor unavailable".to_owned())?;
@@ -450,8 +554,7 @@ mod windows_host {
         tx: &mpsc::Sender<hardware::AtRequest>,
         store: &Store,
     ) -> Result<usize, String> {
-        actor_lines(tx, "AT+CPMS=\"SM\",\"SM\",\"SM\"".into(), None).await?;
-        let lines = actor_lines(tx, "AT+CMGL=\"ALL\"".into(), None).await?;
+        let lines = actor_pdu_snapshot(tx).await?;
         let parsed = modemd::sms::parse_cmgl(&lines);
         let stamp = now();
         let records = parsed
@@ -486,6 +589,12 @@ mod windows_host {
                     source: "sim".into(),
                     storage: "SM".into(),
                     storage_index: x.index,
+                    storage_indices: x.storage_indices,
+                    part_count: x.part_count,
+                    parts_received: x.parts_received,
+                    multipart_complete: x.multipart_complete,
+                    part_payloads: x.part_payloads,
+                    part_timestamps: x.part_timestamps,
                     modem_status: x.modem_status,
                     modem_timestamp: x.modem_timestamp,
                     encoding: x.encoding,
@@ -502,6 +611,30 @@ mod windows_host {
             .collect::<Vec<_>>();
         store.sync_sms(&records, stamp).map_err(|e| e.to_string())?;
         Ok(records.len())
+    }
+    async fn actor_pdu_snapshot(
+        tx: &mpsc::Sender<hardware::AtRequest>,
+    ) -> Result<Vec<String>, String> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        tx.send(hardware::AtRequest {
+            command: String::new(),
+            payload: None,
+            guarded: false,
+            payload_mode: PayloadMode::Sms,
+            batch: vec![
+                "AT+CPMS=\"SM\",\"SM\",\"SM\"".into(),
+                "AT+CMGF=0".into(),
+                "AT+CMGL=4".into(),
+            ],
+            finalizer: Some("AT+CMGF=1".into()),
+            reply,
+        })
+        .map_err(|_| "modem command actor unavailable".to_owned())?;
+        tokio::time::timeout(Duration::from_secs(35), rx)
+            .await
+            .map_err(|_| "modem command timed out".to_owned())?
+            .map_err(|_| "modem command actor stopped".to_owned())?
+            .map_err(|e| e.to_string())
     }
     async fn balance_json(
         tx: &mpsc::Sender<hardware::AtRequest>,
@@ -522,6 +655,9 @@ mod windows_host {
             created_at_ms: stamp,
             kind: "received".into(),
             source: "balance".into(),
+            part_count: 1,
+            parts_received: 1,
+            multipart_complete: true,
             length: raw.chars().count() as i32,
             ..Default::default()
         };
@@ -549,6 +685,9 @@ mod windows_host {
                 command,
                 payload,
                 guarded,
+                payload_mode: PayloadMode::Sms,
+                batch: Vec::new(),
+                finalizer: None,
                 reply,
             })
             .is_err()
@@ -600,19 +739,23 @@ mod windows_host {
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         while tokio::time::Instant::now() < deadline {
-            let response =
-                run_actor(command_tx, "AT+CMGL=\"REC UNREAD\"".into(), None, false).await;
-            if response.starts_with("ERROR:") {
-                return response;
-            }
-            if let Some(message) = viettel_balance_message(&response) {
-                return format!("{message}\n");
+            match actor_pdu_snapshot(command_tx).await {
+                Ok(lines) => {
+                    if let Some(message) = modemd::sms::parse_cmgl(&lines)
+                        .into_iter()
+                        .find(|x| x.peer == "191")
+                    {
+                        return format!("{}\n", message.body);
+                    }
+                }
+                Err(error) => return format!("ERROR: {error}\n"),
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
         "ERROR: timed out waiting for the balance SMS from 191\n".into()
     }
 
+    #[cfg(test)]
     fn viettel_balance_message(response: &str) -> Option<String> {
         let parts: Vec<_> = response.split(" | ").map(str::trim).collect();
         let header = parts.iter().position(|part| {
@@ -648,6 +791,7 @@ mod windows_host {
         })
     }
 
+    #[cfg(test)]
     fn parse_dcs(value: &str) -> Option<u8> {
         let value = value.trim().trim_matches('"');
         value.parse().ok().or_else(|| {
@@ -658,6 +802,7 @@ mod windows_host {
         })
     }
 
+    #[cfg(test)]
     fn looks_like_text(value: &str) -> bool {
         let value = value.strip_prefix('\u{feff}').unwrap_or(value);
         !value.is_empty()
@@ -667,10 +812,12 @@ mod windows_host {
                 .all(|character| !character.is_control() || matches!(character, '\n' | '\r' | '\t'))
     }
 
+    #[cfg(test)]
     fn dcs_uses_ucs2(dcs: u8) -> bool {
         (dcs & 0xc0 == 0 && dcs & 0x0c == 0x08) || dcs & 0xf0 == 0xe0
     }
 
+    #[cfg(test)]
     fn csv_field(value: &str, wanted: usize) -> Option<&str> {
         let mut quoted = false;
         let mut field = 0;
@@ -691,6 +838,7 @@ mod windows_host {
         (field == wanted).then(|| value[start..].trim())
     }
 
+    #[cfg(test)]
     fn decode_ucs2_hex(value: &str) -> Option<String> {
         if value.is_empty()
             || value.len() % 4 != 0

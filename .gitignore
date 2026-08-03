@@ -5,3 +5,4 @@
 *.log
 .env
 /tmp/pdfs/*
+Cargo.lock

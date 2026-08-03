@@ -20,7 +20,13 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const SMS_SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const INITIALIZATION_COMMANDS: &[&str] = &["AT+CMEE=2", "AT+CVHU=0", "AT+CMGF=1"];
-const OPTIONAL_INITIALIZATION_COMMANDS: &[&str] = &["AT+CLCC=1", "AT+CNMI=2,1,0,1,0", "AT+CSDH=1"];
+const OPTIONAL_INITIALIZATION_COMMANDS: &[&str] = &[
+    "AT+CLCC=1",
+    "AT+CNMI=2,1,0,1,0",
+    // TP-SRR requests a network delivery report for SMS-SUBMIT messages.
+    "AT+CSMP=49,167,0,0",
+    "AT+CSDH=1",
+];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PortCandidate {
@@ -70,7 +76,21 @@ pub struct AtRequest {
     pub command: String,
     pub payload: Option<Vec<u8>>,
     pub guarded: bool,
+    pub payload_mode: PayloadMode,
+    /// Commands executed under one actor dequeue, preventing mode changes from
+    /// interleaving with unrelated requests. The finalizer is always attempted.
+    pub batch: Vec<String>,
+    pub finalizer: Option<String>,
     pub reply: tokio::sync::oneshot::Sender<Result<Vec<String>, ModemError>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PayloadMode {
+    #[default]
+    Sms,
+    Raw {
+        pacing: Duration,
+    },
 }
 
 impl InitializedModem {
@@ -111,18 +131,30 @@ pub fn monitor_with_commands(
         if modem.as_ref().is_some_and(InitializedModem::is_present) {
             match commands.recv_timeout(Duration::from_millis(100)) {
                 Ok(request) => {
-                    let result = execute_command(
-                        modem.as_mut().expect("presence checked").port(),
-                        &request.command,
-                        request.payload.as_deref(),
-                        request.guarded,
-                        if request.payload.is_some() {
-                            SMS_SUBMIT_TIMEOUT
-                        } else {
-                            COMMAND_TIMEOUT
-                        },
-                        &mut dispatcher,
-                    );
+                    let port = modem.as_mut().expect("presence checked").port();
+                    let result = if request.batch.is_empty() {
+                        execute_command(
+                            port,
+                            &request.command,
+                            request.payload.as_deref(),
+                            request.guarded,
+                            payload_timeout(request.payload.as_deref(), request.payload_mode),
+                            request.payload_mode,
+                            &mut dispatcher,
+                        )
+                    } else {
+                        run_batch(&request.batch, request.finalizer.as_deref(), |command| {
+                            execute_command(
+                                port,
+                                command,
+                                None,
+                                false,
+                                COMMAND_TIMEOUT,
+                                PayloadMode::Sms,
+                                &mut dispatcher,
+                            )
+                        })
+                    };
                     let _ = request.reply.send(result);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -151,12 +183,42 @@ pub fn monitor_with_commands(
     }
 }
 
+fn run_batch<F>(
+    commands: &[String],
+    finalizer: Option<&str>,
+    mut run: F,
+) -> Result<Vec<String>, ModemError>
+where
+    F: FnMut(&str) -> Result<Vec<String>, ModemError>,
+{
+    let mut result = Ok(Vec::new());
+    for command in commands {
+        match run(command) {
+            Ok(lines) => result = Ok(lines),
+            Err(error) => {
+                result = Err(error);
+                break;
+            }
+        }
+    }
+    if let Some(command) = finalizer {
+        let restored = run(command);
+        if result.is_ok() {
+            if let Err(error) = restored {
+                result = Err(error);
+            }
+        }
+    }
+    result
+}
+
 fn execute_command(
     port: &mut dyn SerialPort,
     command: &str,
     payload: Option<&[u8]>,
     guarded: bool,
     timeout: Duration,
+    payload_mode: PayloadMode,
     dispatcher: &mut Dispatcher,
 ) -> Result<Vec<String>, ModemError> {
     if guarded {
@@ -202,10 +264,19 @@ fn execute_command(
                                 "modem requested an unexpected payload".into(),
                             ));
                         };
-                        port.write_all(payload)
-                            .map_err(|_| ModemError::Disconnected)?;
-                        port.write_all(&[0x1a])
-                            .map_err(|_| ModemError::Disconnected)?;
+                        match payload_mode {
+                            PayloadMode::Sms => {
+                                port.write_all(payload)
+                                    .map_err(|_| ModemError::Disconnected)?;
+                                port.write_all(&[0x1a])
+                                    .map_err(|_| ModemError::Disconnected)?;
+                            }
+                            PayloadMode::Raw { pacing } => {
+                                transfer_raw_payload(payload, pacing, |chunk| {
+                                    port.write_all(chunk).map_err(|_| ModemError::Disconnected)
+                                })?;
+                            }
+                        }
                         port.flush().map_err(|_| ModemError::Disconnected)?;
                     }
                 }
@@ -215,6 +286,35 @@ fn execute_command(
         }
     }
     Err(ModemError::Timeout)
+}
+
+fn payload_timeout(payload: Option<&[u8]>, mode: PayloadMode) -> Duration {
+    match (payload, mode) {
+        (Some(data), PayloadMode::Raw { pacing }) => {
+            let chunks = data.len().div_ceil(crate::audio::TRANSFER_CHUNK_BYTES) as u32;
+            SMS_SUBMIT_TIMEOUT.saturating_add(pacing.saturating_mul(chunks))
+        }
+        (Some(_), PayloadMode::Sms) => SMS_SUBMIT_TIMEOUT,
+        (None, _) => COMMAND_TIMEOUT,
+    }
+}
+
+fn transfer_raw_payload(
+    payload: &[u8],
+    pacing: Duration,
+    mut write: impl FnMut(&[u8]) -> Result<(), ModemError>,
+) -> Result<(), ModemError> {
+    let count = payload.len().div_ceil(crate::audio::TRANSFER_CHUNK_BYTES);
+    for (index, chunk) in payload
+        .chunks(crate::audio::TRANSFER_CHUNK_BYTES)
+        .enumerate()
+    {
+        write(chunk)?;
+        if index + 1 < count && !pacing.is_zero() {
+            thread::sleep(pacing);
+        }
+    }
+    Ok(())
 }
 
 fn publish_if_changed(
@@ -465,7 +565,12 @@ mod tests {
         );
         assert_eq!(
             OPTIONAL_INITIALIZATION_COMMANDS,
-            ["AT+CLCC=1", "AT+CNMI=2,1,0,1,0", "AT+CSDH=1"]
+            [
+                "AT+CLCC=1",
+                "AT+CNMI=2,1,0,1,0",
+                "AT+CSMP=49,167,0,0",
+                "AT+CSDH=1"
+            ]
         );
     }
 
@@ -480,5 +585,67 @@ mod tests {
             reports.push(state)
         });
         assert_eq!(reports, [HardwareState::Disconnected]);
+    }
+
+    #[test]
+    fn batch_restores_mode_after_success_rejection_and_timeout() {
+        for failure in [
+            None,
+            Some(ModemError::CommandRejected("no".into())),
+            Some(ModemError::Timeout),
+        ] {
+            let mut seen = Vec::new();
+            let expect_error = failure.is_some();
+            let mut failure = failure;
+            let result = run_batch(
+                &["AT+CMGF=0".into(), "AT+CMGL=4".into()],
+                Some("AT+CMGF=1"),
+                |command| {
+                    seen.push(command.to_owned());
+                    if command == "AT+CMGL=4" {
+                        if let Some(error) = failure.take() {
+                            return Err(error);
+                        }
+                    }
+                    Ok(vec![command.into()])
+                },
+            );
+            assert_eq!(seen.last().unwrap(), "AT+CMGF=1");
+            assert_eq!(result.is_err(), expect_error);
+        }
+    }
+
+    #[test]
+    fn batch_finalizer_preserves_last_command_response() {
+        let result = run_batch(
+            &["AT+CMGF=0".into(), "AT+CMGL=4".into()],
+            Some("AT+CMGF=1"),
+            |command| {
+                Ok(if command == "AT+CMGL=4" {
+                    vec!["+CMGL: 1,1,,23".into(), "001122".into()]
+                } else {
+                    Vec::new()
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(result, vec!["+CMGL: 1,1,,23", "001122"]);
+    }
+
+    #[test]
+    fn raw_transfer_is_paced_in_256_byte_chunks_without_ctrl_z() {
+        let payload = vec![0x55; 600];
+        let mut writes = Vec::new();
+        transfer_raw_payload(&payload, Duration::ZERO, |chunk| {
+            writes.push(chunk.to_vec());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            writes.iter().map(Vec::len).collect::<Vec<_>>(),
+            [256, 256, 88]
+        );
+        assert_eq!(writes.concat(), payload);
+        assert_ne!(writes.last().and_then(|chunk| chunk.last()), Some(&0x1a));
     }
 }

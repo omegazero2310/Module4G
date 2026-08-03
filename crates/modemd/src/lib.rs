@@ -3,6 +3,7 @@
 pub mod at;
 pub mod audio;
 pub mod call;
+pub mod call_workflow;
 pub mod hardware;
 pub mod settings;
 pub mod sms;

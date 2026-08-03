@@ -18,6 +18,129 @@ mod windows_sim {
         MissingTerminal,
     }
 
+    #[derive(Default)]
+    struct SimState {
+        legacy_scenario: CallScenario,
+        current_audio: Option<serde_json::Value>,
+        calls: Vec<serde_json::Value>,
+        call_scenario: String,
+        polls: u32,
+        settings: Option<serde_json::Value>,
+    }
+
+    fn json_response(request: &str, state: &mut SimState) -> Option<String> {
+        let value: serde_json::Value = serde_json::from_str(request.trim()).ok()?;
+        let command = value.get("command")?.as_str()?;
+        let result = match command {
+            "get_settings" => {
+                serde_json::json!({"ok":true,"data":state.settings.clone().unwrap_or_else(|| serde_json::json!({
+                    "usb_vid":7694,"usb_pid":36881,"port_override":null,"baud":115200,
+                    "call_timeout_seconds":90,"upload_pacing_ms":10,"max_audio_bytes":204800,
+                    "ussd_code":"*101#","ussd_timeout_seconds":30,"currency":"",
+                    "low_balance_threshold":0.0,"balance_regex":null
+                }))})
+            }
+            "update_settings" => {
+                let settings = value.get("settings").cloned().unwrap_or_default();
+                state.settings = Some(settings.clone());
+                serde_json::json!({"ok":true,"data":settings})
+            }
+            "get_current_audio" => serde_json::json!({"ok":true,"data":state.current_audio}),
+            "upload_audio" => {
+                let name = value
+                    .get("name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("call.amr");
+                let size = value
+                    .get("data")
+                    .and_then(|x| x.as_array())
+                    .map_or(0, Vec::len);
+                let audio = serde_json::json!({
+                    "id":"sim-audio","name":name,"format":"AMR-NB","size":size,
+                    "modulePath":"c:/call_sim-audio.amr","durationMs":2000,"createdAtMs":1785722400000_i64,"state":"ready"
+                });
+                state.current_audio = Some(audio.clone());
+                serde_json::json!({"ok":true,"data":audio})
+            }
+            "make_call" => {
+                if state.current_audio.is_none() {
+                    serde_json::json!({"ok":false,"error":"select the current uploaded audio"})
+                } else {
+                    let peer = value
+                        .get("destination")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or_default();
+                    state.call_scenario = match &peer[peer.len().saturating_sub(2)..] {
+                        "02" => "no-answer",
+                        "03" => "busy",
+                        "07" => "playback-failure",
+                        "08" => "missing-completion",
+                        "09" => "early-remote-hang-up",
+                        "10" => "manual-cancellation",
+                        "11" => "delayed-answer",
+                        _ => "success",
+                    }
+                    .into();
+                    state.polls = 0;
+                    let call = serde_json::json!({
+                        "id":"sim-call","peer":peer,"state":"waiting-for-answer","audioId":"sim-audio",
+                        "error":"","durationSeconds":0,"createdAtMs":1785722401000_i64,
+                        "answerClassification":"unknown","endReason":"none","connectedAtMs":0,
+                        "endedAtMs":0,"releaseCause":""
+                    });
+                    state.calls.insert(0, call.clone());
+                    serde_json::json!({"ok":true,"data":call})
+                }
+            }
+            "list_calls" => {
+                state.polls += 1;
+                if let Some(call) = state.calls.first_mut() {
+                    let (status, answer, reason, error) =
+                        match (state.call_scenario.as_str(), state.polls) {
+                            ("no-answer", 3..) => ("ended", "not-answered", "no-answer", ""),
+                            ("busy", 2..) => ("ended", "not-answered", "busy", ""),
+                            ("playback-failure", 4..) => {
+                                ("failed", "answered", "call-error", "playback start failed")
+                            }
+                            ("missing-completion", 10..) => (
+                                "failed",
+                                "answered",
+                                "call-error",
+                                "playback completion timed out",
+                            ),
+                            ("early-remote-hang-up", 2..) => {
+                                ("ended", "answered", "remote-hang-up", "")
+                            }
+                            ("manual-cancellation", 3..) => ("playing", "answered", "none", ""),
+                            ("delayed-answer", 1..=5) => {
+                                ("waiting-for-answer", "unknown", "none", "")
+                            }
+                            (_, 1) => ("playback-delay", "answered", "none", ""),
+                            (_, poll) if (2..=4).contains(&poll) => {
+                                ("playing", "answered", "none", "")
+                            }
+                            (_, poll) if poll >= 5 => ("ended", "answered", "local-hang-up", ""),
+                            _ => ("waiting-for-answer", "unknown", "none", ""),
+                        };
+                    call["state"] = status.into();
+                    call["answerClassification"] = answer.into();
+                    call["endReason"] = reason.into();
+                    call["error"] = error.into();
+                }
+                serde_json::json!({"ok":true,"data":state.calls})
+            }
+            "hang_up" => {
+                if let Some(call) = state.calls.first_mut() {
+                    call["state"] = "ended".into();
+                    call["endReason"] = "local-hang-up".into();
+                }
+                serde_json::json!({"ok":true,"data":null})
+            }
+            _ => return None,
+        };
+        Some(result.to_string() + "\n")
+    }
+
     fn response(command: &str, scenario: &mut CallScenario) -> &'static str {
         let command = command.trim();
         if command.contains("\"command\":\"sync_sms\"") {
@@ -91,22 +214,18 @@ mod windows_sim {
 
     async fn serve_connection(
         server: tokio::net::windows::named_pipe::NamedPipeServer,
-        scenario: Arc<Mutex<CallScenario>>,
+        state: Arc<Mutex<SimState>>,
     ) -> io::Result<()> {
         server.connect().await?;
         let mut line = String::new();
         let mut stream = BufReader::new(server);
         while stream.read_line(&mut line).await? != 0 {
-            stream
-                .get_mut()
-                .write_all(
-                    response(
-                        &line,
-                        &mut scenario.lock().unwrap_or_else(|lock| lock.into_inner()),
-                    )
-                    .as_bytes(),
-                )
-                .await?;
+            let reply = {
+                let mut state = state.lock().unwrap_or_else(|lock| lock.into_inner());
+                json_response(&line, &mut state)
+                    .unwrap_or_else(|| response(&line, &mut state.legacy_scenario).to_owned())
+            };
+            stream.get_mut().write_all(reply.as_bytes()).await?;
             stream.get_mut().flush().await?;
             line.clear();
         }
@@ -115,10 +234,10 @@ mod windows_sim {
 
     pub async fn run() -> io::Result<()> {
         eprintln!("modem-sim listening on {PIPE}");
-        let scenario = Arc::new(Mutex::new(CallScenario::default()));
+        let state = Arc::new(Mutex::new(SimState::default()));
         loop {
             let server = ServerOptions::new().create(PIPE)?;
-            if let Err(error) = serve_connection(server, Arc::clone(&scenario)).await {
+            if let Err(error) = serve_connection(server, Arc::clone(&state)).await {
                 eprintln!("simulator client error: {error}");
             }
         }

@@ -179,6 +179,10 @@ struct Record {
     source: String,
     storage: String,
     storage_index: i32,
+    storage_indices: Vec<i32>,
+    part_count: i32,
+    parts_received: i32,
+    multipart_complete: bool,
     modem_status: String,
     modem_timestamp: String,
     encoding: String,
@@ -190,13 +194,30 @@ struct Record {
     synchronized_at_ms: i64,
     present_on_modem: bool,
     sms_id: String,
+    audio_id: String,
+    error: String,
+    duration_seconds: u32,
+    connected_at_ms: i64,
+    ended_at_ms: i64,
     #[serde(skip)]
     voice_begin_seen: bool,
 }
 
 struct AppState {
     settings: Mutex<CoreSettings>,
-    calls: Mutex<Vec<Record>>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UploadedAudio {
+    id: String,
+    name: String,
+    format: String,
+    size: u64,
+    module_path: String,
+    duration_ms: u64,
+    created_at_ms: i64,
+    state: String,
 }
 
 impl Default for Record {
@@ -217,6 +238,10 @@ impl Default for Record {
             source: String::new(),
             storage: String::new(),
             storage_index: -1,
+            storage_indices: Vec::new(),
+            part_count: 1,
+            parts_received: 1,
+            multipart_complete: true,
             modem_status: String::new(),
             modem_timestamp: String::new(),
             encoding: String::new(),
@@ -228,6 +253,11 @@ impl Default for Record {
             synchronized_at_ms: 0,
             present_on_modem: false,
             sms_id: String::new(),
+            audio_id: String::new(),
+            error: String::new(),
+            duration_seconds: 0,
+            connected_at_ms: 0,
+            ended_at_ms: 0,
             voice_begin_seen: false,
         }
     }
@@ -304,24 +334,40 @@ async fn get_status() -> Result<Status, String> {
 }
 
 #[tauri::command]
-fn get_settings(state: tauri::State<'_, AppState>) -> Result<Settings, String> {
+async fn get_settings(state: tauri::State<'_, AppState>) -> Result<Settings, String> {
     log_event("APP", "Settings opened");
-    Ok(state
-        .settings
-        .lock()
-        .map_err(|_| "Settings lock failed")?
-        .clone()
-        .into())
+    #[cfg(windows)]
+    {
+        let core: CoreSettings =
+            request_json(serde_json::json!({"command":"get_settings"})).await?;
+        *state.settings.lock().map_err(|_| "Settings lock failed")? = core.clone();
+        Ok(core.into())
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(state
+            .settings
+            .lock()
+            .map_err(|_| "Settings lock failed")?
+            .clone()
+            .into())
+    }
 }
 
 #[tauri::command]
-fn update_settings(
+async fn update_settings(
     settings: Settings,
     state: tauri::State<'_, AppState>,
 ) -> Result<Settings, String> {
     log_event("APP", "Settings save requested (values not logged)");
     let core: CoreSettings = settings.into();
     core.validate().map_err(|e| e.to_string())?;
+    #[cfg(windows)]
+    let core: CoreSettings = request_json(serde_json::json!({
+        "command":"update_settings",
+        "settings":core
+    }))
+    .await?;
     *state.settings.lock().map_err(|_| "Settings lock failed")? = core.clone();
     log_event("APP", "Settings validated and applied");
     Ok(core.into())
@@ -368,23 +414,6 @@ async fn execute_at(command: String) -> Result<Vec<String>, String> {
 #[tauri::command]
 async fn execute_at(_command: String) -> Result<Vec<String>, String> {
     Err("AT execution is available only on Windows.".into())
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-fn id() -> String {
-    format!("{:x}", now_ms())
-}
-fn ensure_ok(response: String) -> Result<String, String> {
-    if response.starts_with("ERROR:") || response.trim() == "ERROR" {
-        Err(response.trim().into())
-    } else {
-        Ok(response.trim().into())
-    }
 }
 
 #[cfg(windows)]
@@ -470,59 +499,66 @@ async fn sync_sms() -> Result<usize, String> {
 #[tauri::command]
 async fn make_call(
     destination: String,
-    state: tauri::State<'_, AppState>,
+    audio_id: String,
+    _state: tauri::State<'_, AppState>,
 ) -> Result<Record, String> {
     let destination = modemd::sms::normalize_number(&destination).map_err(|e| e.to_string())?;
-    let detail = ensure_ok(request_line(&format!("DIAL|{destination}")).await?)?;
-    let record = Record {
-        id: id(),
-        peer: destination,
-        body: String::new(),
-        state: "dialing".into(),
-        detail,
-        created_at_ms: now_ms(),
-        answer_classification: "unknown".into(),
-        end_reason: "none".into(),
-        alerting_at_ms: 0,
-        release_cause: String::new(),
-        voice_begin_seen: false,
-        ..Default::default()
-    };
-    state
-        .calls
-        .lock()
-        .map_err(|_| "Call history lock failed")?
-        .insert(0, record.clone());
-    Ok(record)
+    request_json(serde_json::json!({
+        "command":"make_call",
+        "destination":destination,
+        "audioId":audio_id
+    }))
+    .await
 }
 #[cfg(not(windows))]
 #[tauri::command]
 async fn make_call(
     _destination: String,
+    _audio_id: String,
     _state: tauri::State<'_, AppState>,
 ) -> Result<Record, String> {
     Err("Calls are available only on Windows.".into())
 }
+
 #[cfg(windows)]
 #[tauri::command]
-async fn hang_up(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    ensure_ok(request_line("HANGUP").await?)?;
-    if let Some(call) = state
-        .calls
-        .lock()
-        .map_err(|_| "Call history lock failed")?
-        .iter_mut()
-        .find(|call| is_live_call(&call.state))
-    {
-        call.state = "ended".into();
-        call.detail = "Local hang-up".into();
-        call.end_reason = "Local hang-up".into();
-        call.answer_classification = if call.voice_begin_seen {
-            "Answered".into()
-        } else {
-            "Unknown".into()
-        };
-    }
+async fn get_current_audio() -> Result<Option<UploadedAudio>, String> {
+    request_json(serde_json::json!({"command":"get_current_audio"})).await
+}
+#[cfg(not(windows))]
+#[tauri::command]
+async fn get_current_audio() -> Result<Option<UploadedAudio>, String> {
+    Ok(None)
+}
+
+#[cfg(windows)]
+#[tauri::command]
+async fn upload_audio(
+    name: String,
+    data: Vec<u8>,
+    state: tauri::State<'_, AppState>,
+) -> Result<UploadedAudio, String> {
+    let settings: CoreSettings =
+        request_json(serde_json::json!({"command":"get_settings"})).await?;
+    *state.settings.lock().map_err(|_| "Settings lock failed")? = settings.clone();
+    modemd::audio::validate_audio_name(&name).map_err(|e| e.to_string())?;
+    modemd::audio::inspect_amr(&data, settings.max_audio_bytes).map_err(|e| e.to_string())?;
+    request_json(serde_json::json!({"command":"upload_audio","name":name,"data":data})).await
+}
+#[cfg(not(windows))]
+#[tauri::command]
+async fn upload_audio(
+    _name: String,
+    _data: Vec<u8>,
+    _state: tauri::State<'_, AppState>,
+) -> Result<UploadedAudio, String> {
+    Err("Audio upload is available only on Windows.".into())
+}
+
+#[cfg(windows)]
+#[tauri::command]
+async fn hang_up(_state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let _: serde_json::Value = request_json(serde_json::json!({"command":"hang_up"})).await?;
     Ok(())
 }
 #[cfg(not(windows))]
@@ -530,219 +566,22 @@ async fn hang_up(state: tauri::State<'_, AppState>) -> Result<(), String> {
 async fn hang_up(_state: tauri::State<'_, AppState>) -> Result<(), String> {
     Err("Calls are available only on Windows.".into())
 }
-fn is_live_call(state: &str) -> bool {
-    matches!(state, "dialing" | "ringing" | "active")
-}
-
-fn end_reason_label(reason: modemd::call::EndReason) -> &'static str {
-    use modemd::call::EndReason::*;
-    match reason {
-        None => "None",
-        LocalHangUp => "Local hang-up",
-        RemoteHangUp => "Remote hang-up",
-        Busy => "Busy",
-        NoAnswer => "No answer",
-        Unreachable => "Unreachable / cannot connect",
-        NetworkError => "Network error",
-        SignalingTimeout => "Signaling timeout",
-        ModemLost => "Modem lost",
-        CallError => "Call error",
-    }
-}
-
-/// Applies all events from one poll as a batch. Explicit terminal result codes
-/// take precedence even when a generic END/NO CARRIER occurs in the same read.
-fn apply_call_response(call: &mut Record, response: &str) -> bool {
-    let lines: Vec<_> = response.split(" | ").map(str::trim).collect();
-    let explicit = if lines.contains(&"BUSY") {
-        Some(("Busy", "Busy"))
-    } else if lines.contains(&"NO ANSWER") {
-        Some(("No answer", "No answer"))
-    } else {
-        None
-    };
-    let mut needs_ceer = false;
-    for line in lines {
-        if line == "VOICE CALL: BEGIN" || line == "VOICE CALL:BEGIN" {
-            call.voice_begin_seen = true;
-            call.answer_classification = "Answered".into();
-            call.state = "active".into();
-        } else if line.starts_with("VOICE CALL: END") || line.starts_with("VOICE CALL:END") {
-            needs_ceer = true;
-            call.state = "ended".into();
-            if !call.voice_begin_seen {
-                call.answer_classification = "Not answered".into();
-                call.end_reason = "No answer".into();
-            } else {
-                call.end_reason = "Remote hang-up".into();
-            }
-        } else if line == "NO CARRIER" {
-            needs_ceer = true;
-            call.state = "ended".into();
-        } else if let Some(event) = modemd::call::parse_urc(line)
-            && let modemd::call::CallUrc::Clcc {
-                direction: 0,
-                state,
-            } = event
-        {
-            call.state = match state {
-                2 => "dialing",
-                3 => "ringing",
-                0 | 4 | 5 => "active",
-                _ => call.state.as_str(),
-            }
-            .into();
-        }
-    }
-    if let Some((state, reason)) = explicit {
-        call.state = "ended".into();
-        call.answer_classification = "Not answered".into();
-        call.end_reason = reason.into();
-        call.detail = state.into();
-    } else {
-        call.detail = response.into();
-    }
-    needs_ceer
-}
-
-fn apply_release_cause(call: &mut Record, response: &str) {
-    let cause = response
-        .split(" | ")
-        .find(|line| line.trim().starts_with("+CEER:"))
-        .unwrap_or(response)
-        .trim()
-        .trim_start_matches("+CEER:")
-        .trim();
-    let cause = modemd::call::sanitize_cause(cause);
-    call.release_cause = cause.clone();
-    if matches!(
-        call.end_reason.as_str(),
-        "Busy" | "No answer" | "Local hang-up"
-    ) {
-        return;
-    }
-    let reason = modemd::call::classify_ceer(&cause, call.voice_begin_seen);
-    call.end_reason = end_reason_label(reason).into();
-    call.answer_classification = if call.voice_begin_seen {
-        "Answered".into()
-    } else {
-        "Not answered".into()
-    };
-}
 
 #[cfg(windows)]
 #[tauri::command]
-async fn list_calls(state: tauri::State<'_, AppState>) -> Result<Vec<Record>, String> {
-    let has_live_call = state
-        .calls
-        .lock()
-        .map_err(|_| "Call history lock failed")?
-        .iter()
-        .any(|call| is_live_call(&call.state));
-    if has_live_call {
-        let response = ensure_ok(request_line("CALLSTATUS").await?)?;
-        let settings = state
-            .settings
-            .lock()
-            .map_err(|_| "Settings lock failed")?
-            .clone();
-        let current_ms = now_ms();
-        let (needs_ceer, overall_timeout) = {
-            let mut needs_ceer = false;
-            let mut overall_timeout = false;
-            let mut calls = state.calls.lock().map_err(|_| "Call history lock failed")?;
-            if let Some(call) = calls.iter_mut().find(|call| is_live_call(&call.state)) {
-                needs_ceer = apply_call_response(call, &response);
-                if is_live_call(&call.state)
-                    && current_ms.saturating_sub(call.created_at_ms)
-                        >= u64::from(settings.call_timeout_seconds) * 1_000
-                {
-                    call.state = "ended".into();
-                    call.detail =
-                        "No terminal call signaling was received before the safety timeout".into();
-                    call.answer_classification = "Unknown".into();
-                    call.end_reason = "Signaling timeout".into();
-                    overall_timeout = true;
-                }
-            }
-            (needs_ceer, overall_timeout)
-        };
-        if needs_ceer {
-            let cause = ensure_ok(request_line("CALLCAUSE").await?)?;
-            let mut calls = state.calls.lock().map_err(|_| "Call history lock failed")?;
-            if let Some(call) = calls.first_mut().filter(|call| call.state == "ended") {
-                apply_release_cause(call, &cause);
-            }
-        }
-        if overall_timeout {
-            ensure_ok(request_line("HANGUP").await?)?;
-        }
-    }
-    Ok(state
-        .calls
-        .lock()
-        .map_err(|_| "Call history lock failed")?
-        .clone())
+async fn list_calls(_state: tauri::State<'_, AppState>) -> Result<Vec<Record>, String> {
+    request_json(serde_json::json!({"command":"list_calls"})).await
 }
 
 #[cfg(not(windows))]
 #[tauri::command]
-async fn list_calls(state: tauri::State<'_, AppState>) -> Result<Vec<Record>, String> {
-    Ok(state
-        .calls
-        .lock()
-        .map_err(|_| "Call history lock failed")?
-        .clone())
+async fn list_calls(_state: tauri::State<'_, AppState>) -> Result<Vec<Record>, String> {
+    Ok(Vec::new())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_call_progress_and_terminal_results() {
-        let mut call = test_call();
-        assert!(!apply_call_response(&mut call, "+CLCC: 1,0,3,0,0"));
-        assert_eq!(call.state, "ringing");
-        apply_call_response(&mut call, "+CLCC: 1,0,0,0,0");
-        assert_eq!(call.answer_classification, "unknown");
-        assert!(apply_call_response(
-            &mut call,
-            "VOICE CALL: BEGIN | VOICE CALL: END | NO CARRIER"
-        ));
-        assert_eq!(call.answer_classification, "Answered");
-        assert_eq!(call.end_reason, "Remote hang-up");
-    }
-
-    fn test_call() -> Record {
-        Record {
-            id: "1".into(),
-            peer: String::new(),
-            body: String::new(),
-            state: "dialing".into(),
-            detail: String::new(),
-            created_at_ms: 0,
-            answer_classification: "unknown".into(),
-            end_reason: "none".into(),
-            alerting_at_ms: 0,
-            release_cause: String::new(),
-            voice_begin_seen: false,
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn explicit_result_overrides_generic_terminal_in_same_batch() {
-        let mut call = test_call();
-        assert!(apply_call_response(
-            &mut call,
-            "VOICE CALL: END | NO CARRIER | BUSY"
-        ));
-        assert_eq!(call.answer_classification, "Not answered");
-        assert_eq!(call.end_reason, "Busy");
-        apply_release_cause(&mut call, "+CEER: 16 Normal call clearing");
-        assert_eq!(call.end_reason, "Busy");
-    }
 
     #[test]
     fn console_logging_redacts_private_request_data() {
@@ -829,7 +668,6 @@ fn main() {
     tauri::Builder::default()
         .manage(AppState {
             settings: Mutex::new(CoreSettings::default()),
-            calls: Mutex::new(Vec::new()),
         })
         .invoke_handler(tauri::generate_handler![
             get_status,
@@ -840,6 +678,8 @@ fn main() {
             send_sms,
             sync_sms,
             list_sms,
+            get_current_audio,
+            upload_audio,
             make_call,
             hang_up,
             list_calls,

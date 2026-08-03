@@ -29,6 +29,8 @@ pub enum CallProgress {
     Dialing,
     Ringing,
     Active,
+    PlaybackDelay,
+    Playing,
     Ended,
 }
 
@@ -40,6 +42,7 @@ pub enum CallUrc {
     Busy,
     NoAnswer,
     NoCarrier,
+    AudioPlayStop,
 }
 
 pub fn parse_urc(line: &str) -> Option<CallUrc> {
@@ -59,6 +62,9 @@ pub fn parse_urc(line: &str) -> Option<CallUrc> {
         "BUSY" => Some(CallUrc::Busy),
         "NO ANSWER" => Some(CallUrc::NoAnswer),
         "NO CARRIER" => Some(CallUrc::NoCarrier),
+        value if value.eq_ignore_ascii_case("+AUDIOSTATE: audio play stop") => {
+            Some(CallUrc::AudioPlayStop)
+        }
         _ => None,
     }
 }
