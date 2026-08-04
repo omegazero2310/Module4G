@@ -17,6 +17,7 @@ use std::{
 use tokio::sync::Mutex as AsyncMutex;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+const RELEASE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 struct ActiveCall {
@@ -51,6 +52,17 @@ impl CallManager {
 
     pub fn current_audio(&self) -> Result<Option<UploadedAudioRecord>, ModemError> {
         self.store.current_audio()
+    }
+
+    pub fn list_audio(&self) -> Result<Vec<UploadedAudioRecord>, ModemError> {
+        self.store.list_audio()
+    }
+
+    pub fn select_audio(&self, id: &str) -> Result<UploadedAudioRecord, ModemError> {
+        if self.call_active() || self.uploading.load(Ordering::Acquire) {
+            return Err(ModemError::Busy);
+        }
+        self.store.select_audio(id)
     }
 
     pub fn settings(&self) -> Settings {
@@ -114,7 +126,7 @@ impl CallManager {
         let mut id = ulid::Ulid::new().to_string();
         let mut target_path = module_path(&id)?;
         let mut target_name = module_filename(&id)?;
-        let previous = self.store.current_audio()?;
+        let replaced = self.store.audio_named(&name)?;
         let configured_pacing = Duration::from_millis(u64::from(settings.upload_pacing_ms));
         let first_result = actor_lines(
             &self.command_tx,
@@ -171,14 +183,23 @@ impl CallManager {
             duration_ms: info.duration.as_millis() as u64,
             created_at_ms: now_ms(),
             state: "ready".into(),
+            is_current: true,
         };
-        self.store.save_current_audio(&audio)?;
-
-        if let Some(previous) = previous.filter(|old| old.id != audio.id) {
+        if let Some(previous) = replaced.as_ref() {
             if module_path(&previous.id).as_deref() == Ok(previous.module_path.as_str()) {
                 let previous_name = module_filename(&previous.id)?;
-                let _ = delete_module_file(&self.command_tx, &previous_name).await;
+                if let Err(error) = delete_module_file(&self.command_tx, &previous_name).await {
+                    let _ = delete_module_file(&self.command_tx, &target_name).await;
+                    return Err(upload_stage_error("replacement cleanup", error));
+                }
             }
+        }
+        if let Err(error) = self
+            .store
+            .replace_and_select_audio(&audio, replaced.as_ref().map(|old| old.id.as_str()))
+        {
+            let _ = delete_module_file(&self.command_tx, &target_name).await;
+            return Err(error);
         }
         Ok(audio)
     }
@@ -240,19 +261,18 @@ impl CallManager {
         let _gate = active.command_gate.lock().await;
         active.cancelled.store(true, Ordering::Release);
         let was_playing = with_record(&active, |record| record.state == "playing");
-        if was_playing {
-            let _ = actor_lines(
-                &self.command_tx,
-                "AT+CCMXSTOP".into(),
-                None,
-                PayloadMode::Sms,
-            )
-            .await;
+        match self.release_and_confirm(&active, was_playing).await {
+            Ok(()) => {
+                self.finish(&active, "ended", "local-hang-up", "", true);
+                self.clear_active(&active.id);
+                Ok(())
+            }
+            Err(error) => {
+                active.cancelled.store(false, Ordering::Release);
+                self.mark_hang_up_failed(&active, &error.to_string());
+                Err(error)
+            }
         }
-        let hang_result = actor_lines(&self.command_tx, "ATH".into(), None, PayloadMode::Sms).await;
-        self.finish(&active, "ended", "local-hang-up", "", true);
-        self.clear_active(&active.id);
-        hang_result.map(|_| ())
     }
 
     async fn run_call(self: Arc<Self>, active: ActiveCall, audio: UploadedAudioRecord) {
@@ -277,8 +297,17 @@ impl CallManager {
 
         loop {
             if active.cancelled.load(Ordering::Acquire) {
-                self.clear_active(&active.id);
-                return;
+                let still_active = self
+                    .active
+                    .lock()
+                    .unwrap_or_else(|lock| lock.into_inner())
+                    .as_ref()
+                    .is_some_and(|call| call.id == active.id);
+                if !still_active {
+                    return;
+                }
+                tokio::time::sleep(POLL_INTERVAL).await;
+                continue;
             }
 
             let lines =
@@ -300,6 +329,18 @@ impl CallManager {
                 &lines,
                 with_record(&active, |record| record.connected_at_ms > 0),
             );
+            if with_record(&active, |record| record.state == "hang-up-failed") {
+                if !lines
+                    .iter()
+                    .any(|line| matches!(parse_urc(line), Some(crate::call::CallUrc::Clcc { .. })))
+                {
+                    self.finish(&active, "ended", "local-hang-up", "", true);
+                    self.clear_active(&active.id);
+                    return;
+                }
+                tokio::time::sleep(POLL_INTERVAL).await;
+                continue;
+            }
             if let Some((classification, reason)) = explicit {
                 self.finish_remote(&active, classification, reason).await;
                 return;
@@ -313,16 +354,13 @@ impl CallManager {
                 if active.cancelled.load(Ordering::Acquire) {
                     continue;
                 }
-                let hang =
-                    actor_lines(&self.command_tx, "ATH".into(), None, PayloadMode::Sms).await;
-                if let Err(error) = hang {
-                    drop(_gate);
-                    self.fail_safely(
+                if let Err(error) = self.release_and_confirm(&active, true).await {
+                    self.mark_hang_up_failed(
                         &active,
-                        true,
-                        format!("hang-up after playback failed: {error}"),
-                    )
-                    .await;
+                        &format!("hang-up after playback failed: {error}"),
+                    );
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                    continue;
                 } else {
                     self.finish(&active, "ended", "local-hang-up", "", true);
                     self.clear_active(&active.id);
@@ -425,16 +463,15 @@ impl CallManager {
         if active.cancelled.load(Ordering::Acquire) {
             return;
         }
-        if playback_started {
-            let _ = actor_lines(
-                &self.command_tx,
-                "AT+CCMXSTOP".into(),
-                None,
-                PayloadMode::Sms,
-            )
-            .await;
+        if let Err(release_error) = self.release_and_confirm(active, playback_started).await {
+            self.mark_hang_up_failed(
+                active,
+                &format!("{error}; release confirmation failed: {release_error}"),
+            );
+            drop(_gate);
+            self.monitor_failed_release(active).await;
+            return;
         }
-        let _ = actor_lines(&self.command_tx, "ATH".into(), None, PayloadMode::Sms).await;
         let reason = if error.contains("signaling timed out") {
             "signaling-timeout"
         } else if error.contains("disconnected") || error.contains("actor stopped") {
@@ -444,6 +481,73 @@ impl CallManager {
         };
         self.finish(active, "failed", reason, &error, false);
         self.clear_active(&active.id);
+    }
+
+    async fn release_and_confirm(
+        &self,
+        _active: &ActiveCall,
+        playback_started: bool,
+    ) -> Result<(), ModemError> {
+        if playback_started {
+            let _ = actor_lines(
+                &self.command_tx,
+                "AT+CCMXSTOP".into(),
+                None,
+                PayloadMode::Sms,
+            )
+            .await;
+        }
+        actor_lines(&self.command_tx, "AT+CHUP".into(), None, PayloadMode::Sms).await?;
+        let deadline = tokio::time::Instant::now() + RELEASE_CONFIRM_TIMEOUT;
+        loop {
+            let lines =
+                actor_lines(&self.command_tx, "AT+CLCC".into(), None, PayloadMode::Sms).await?;
+            if !lines
+                .iter()
+                .any(|line| matches!(parse_urc(line), Some(crate::call::CallUrc::Clcc { .. })))
+            {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ModemError::Timeout);
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    fn mark_hang_up_failed(&self, active: &ActiveCall, error: &str) {
+        with_record(active, |record| {
+            record.state = "hang-up-failed".into();
+            record.error = error.into();
+            let _ = self.store.save_call(record);
+        });
+    }
+
+    async fn monitor_failed_release(&self, active: &ActiveCall) {
+        loop {
+            if active.cancelled.load(Ordering::Acquire) {
+                tokio::time::sleep(POLL_INTERVAL).await;
+                continue;
+            }
+            let _gate = active.command_gate.lock().await;
+            if active.cancelled.load(Ordering::Acquire) {
+                continue;
+            }
+            if actor_lines(&self.command_tx, "AT+CLCC".into(), None, PayloadMode::Sms)
+                .await
+                .is_ok_and(|lines| {
+                    !lines.iter().any(|line| {
+                        matches!(parse_urc(line), Some(crate::call::CallUrc::Clcc { .. }))
+                    })
+                })
+            {
+                self.finish(active, "ended", "local-hang-up", "", true);
+                self.clear_active(&active.id);
+                return;
+            }
+            drop(_gate);
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
     }
 
     fn finish(&self, active: &ActiveCall, state: &str, reason: &str, error: &str, local: bool) {
@@ -705,6 +809,7 @@ mod tests {
                 duration_ms: 20,
                 created_at_ms: 1,
                 state: "ready".into(),
+                is_current: true,
             })
             .unwrap();
         let (tx, rx) = mpsc::channel();
@@ -744,6 +849,7 @@ mod tests {
             let mut began = false;
             let mut played = false;
             let mut polls_after_play = 0;
+            let mut releasing = false;
             while let Ok(request) = rx.recv() {
                 let command = request.command.clone();
                 actor_seen.lock().unwrap().push(command.clone());
@@ -763,10 +869,13 @@ mod tests {
                     if command.starts_with("AT+CCMXPLAY") {
                         played = true;
                     }
+                    if command == "AT+CHUP" {
+                        releasing = true;
+                    }
                     Vec::new()
                 };
                 let _ = request.reply.send(Ok(lines));
-                if command == "ATH" {
+                if releasing && command == "AT+CLCC" {
                     break;
                 }
             }
@@ -788,7 +897,10 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(seen.iter().filter(|command| *command == "ATH").count(), 1);
+        assert_eq!(
+            seen.iter().filter(|command| *command == "AT+CHUP").count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -798,6 +910,7 @@ mod tests {
         let actor_seen = Arc::clone(&seen);
         let actor = thread::spawn(move || {
             let mut began = false;
+            let mut releasing = false;
             while let Ok(request) = rx.recv() {
                 let command = request.command.clone();
                 actor_seen.lock().unwrap().push(command.clone());
@@ -805,10 +918,13 @@ mod tests {
                     began = true;
                     vec!["VOICE CALL: BEGIN".into()]
                 } else {
+                    if command == "AT+CHUP" {
+                        releasing = true;
+                    }
                     Vec::new()
                 };
                 let _ = request.reply.send(Ok(lines));
-                if command == "ATH" {
+                if releasing && command == "AT+CLCC" {
                     break;
                 }
             }
@@ -831,7 +947,10 @@ mod tests {
                 .iter()
                 .any(|command| command.starts_with("AT+CCMXPLAY"))
         );
-        assert_eq!(seen.iter().filter(|command| *command == "ATH").count(), 1);
+        assert_eq!(
+            seen.iter().filter(|command| *command == "AT+CHUP").count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -839,6 +958,7 @@ mod tests {
         let (manager, rx, store) = manager_fixture();
         let actor = thread::spawn(move || {
             let mut began = false;
+            let mut releasing = false;
             while let Ok(request) = rx.recv() {
                 let command = request.command.clone();
                 let result = if command == "AT+CLCC" && !began {
@@ -847,10 +967,13 @@ mod tests {
                 } else if command.starts_with("AT+CCMXPLAY") {
                     Err(ModemError::CommandRejected("ERROR".into()))
                 } else {
+                    if command == "AT+CHUP" {
+                        releasing = true;
+                    }
                     Ok(Vec::new())
                 };
                 let _ = request.reply.send(result);
-                if command == "ATH" {
+                if releasing && command == "AT+CLCC" {
                     break;
                 }
             }
@@ -863,6 +986,52 @@ mod tests {
         actor.join().unwrap();
         assert!(failed.error.contains("playback start failed"));
         assert_eq!(failed.end_reason, "call-error");
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_release_blocks_calls_until_hang_up_retry_succeeds() {
+        let (manager, rx, store) = manager_fixture();
+        let actor = thread::spawn(move || {
+            let mut began = false;
+            let mut release_attempts = 0;
+            while let Ok(request) = rx.recv() {
+                let command = request.command.clone();
+                if command == "AT+CHUP" {
+                    release_attempts += 1;
+                }
+                let lines = if command == "AT+CLCC" && !began {
+                    began = true;
+                    vec!["VOICE CALL: BEGIN".into(), "+CLCC: 1,0,0,0,0".into()]
+                } else if command == "AT+CLCC" && release_attempts < 2 {
+                    vec!["+CLCC: 1,0,0,0,0".into()]
+                } else {
+                    Vec::new()
+                };
+                let _ = request.reply.send(Ok(lines));
+                if release_attempts >= 2 && command == "AT+CLCC" {
+                    break;
+                }
+            }
+        });
+
+        manager
+            .make_call("+66812345678".into(), "audio".into())
+            .await
+            .unwrap();
+        wait_for_state(&store, "playback-delay", Duration::from_secs(1)).await;
+        assert!(manager.hang_up().await.is_err());
+        wait_for_state(&store, "hang-up-failed", Duration::from_secs(1)).await;
+        assert!(matches!(
+            manager
+                .make_call("+66812345679".into(), "audio".into())
+                .await,
+            Err(ModemError::Busy)
+        ));
+        manager.hang_up().await.unwrap();
+        let ended = wait_for_state(&store, "ended", Duration::from_secs(1)).await;
+        actor.join().unwrap();
+        assert_eq!(ended.end_reason, "local-hang-up");
+        assert!(!manager.call_active());
     }
 
     #[tokio::test]
@@ -897,7 +1066,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let actor_seen = Arc::clone(&seen);
         let actor = thread::spawn(move || {
-            for index in 0..5 {
+            for index in 0..4 {
                 let request = rx.recv().unwrap();
                 actor_seen.lock().unwrap().push((
                     request.command.clone(),
@@ -951,13 +1120,7 @@ mod tests {
         assert!(!seen[1].2[1].contains("C:/"));
         assert_eq!(seen[3].2[0], "AT+FSCD=C:");
         assert!(seen[3].2[1].starts_with("AT+FSATTRI=\"call_"));
-        assert_eq!(
-            seen[4].2,
-            [
-                "AT+FSCD=C:".to_owned(),
-                "AT+FSDEL=\"call_audio.amr\"".to_owned()
-            ]
-        );
+        assert_eq!(store.list_audio().unwrap().len(), 2);
     }
 
     #[tokio::test]

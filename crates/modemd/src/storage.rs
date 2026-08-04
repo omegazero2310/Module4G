@@ -59,6 +59,7 @@ pub struct UploadedAudioRecord {
     pub duration_ms: u64,
     pub created_at_ms: i64,
     pub state: String,
+    pub is_current: bool,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -200,6 +201,11 @@ impl Store {
              CREATE UNIQUE INDEX IF NOT EXISTS uploaded_audio_one_current ON uploaded_audio(is_current) WHERE is_current=1;
              INSERT OR IGNORE INTO schema_migrations(version) VALUES (5);",
         ).map_err(db_error)?;
+        connection.execute_batch(
+            "DELETE FROM uploaded_audio WHERE is_current=0 AND NOT EXISTS(SELECT 1 FROM schema_migrations WHERE version=6);
+             CREATE UNIQUE INDEX IF NOT EXISTS uploaded_audio_name_nocase ON uploaded_audio(lower(trim(name)));
+             INSERT OR IGNORE INTO schema_migrations(version) VALUES (6);",
+        ).map_err(db_error)?;
         Ok(())
     }
 
@@ -232,7 +238,7 @@ impl Store {
     pub fn current_audio(&self) -> Result<Option<UploadedAudioRecord>, ModemError> {
         self.connection()?
             .query_row(
-                "SELECT id,name,format,size,module_path,duration_ms,created_at_ms FROM uploaded_audio WHERE is_current=1 LIMIT 1",
+                "SELECT id,name,format,size,module_path,duration_ms,created_at_ms,is_current FROM uploaded_audio WHERE is_current=1 LIMIT 1",
                 [],
                 |row| {
                     Ok(UploadedAudioRecord {
@@ -244,6 +250,7 @@ impl Store {
                         duration_ms: row.get(5)?,
                         created_at_ms: row.get(6)?,
                         state: "ready".into(),
+                        is_current: row.get(7)?,
                     })
                 },
             )
@@ -261,10 +268,82 @@ impl Store {
             )
             .map_err(db_error)?;
         transaction.execute(
+            "INSERT INTO uploaded_audio(id,name,format,size,module_path,duration_ms,created_at_ms,is_current) VALUES(?1,?2,?3,?4,?5,?6,?7,1) ON CONFLICT(id) DO UPDATE SET name=excluded.name,format=excluded.format,size=excluded.size,module_path=excluded.module_path,duration_ms=excluded.duration_ms,created_at_ms=excluded.created_at_ms,is_current=1",
+            params![audio.id,audio.name,audio.format,audio.size,audio.module_path,audio.duration_ms,audio.created_at_ms],
+        ).map_err(db_error)?;
+        transaction.commit().map_err(db_error)
+    }
+
+    pub fn list_audio(&self) -> Result<Vec<UploadedAudioRecord>, ModemError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id,name,format,size,module_path,duration_ms,created_at_ms,is_current FROM uploaded_audio ORDER BY is_current DESC,created_at_ms DESC,id DESC",
+        ).map_err(db_error)?;
+        statement
+            .query_map([], audio_from_row)
+            .map_err(db_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_error)
+    }
+
+    pub fn audio_named(&self, name: &str) -> Result<Option<UploadedAudioRecord>, ModemError> {
+        self.connection()?.query_row(
+            "SELECT id,name,format,size,module_path,duration_ms,created_at_ms,is_current FROM uploaded_audio WHERE lower(trim(name))=lower(trim(?1)) LIMIT 1",
+            [name], audio_from_row,
+        ).optional().map_err(db_error)
+    }
+
+    pub fn replace_and_select_audio(
+        &self,
+        audio: &UploadedAudioRecord,
+        replaced_id: Option<&str>,
+    ) -> Result<(), ModemError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction().map_err(db_error)?;
+        transaction
+            .execute(
+                "UPDATE uploaded_audio SET is_current=0 WHERE is_current=1",
+                [],
+            )
+            .map_err(db_error)?;
+        if let Some(id) = replaced_id {
+            transaction
+                .execute("DELETE FROM uploaded_audio WHERE id=?1", [id])
+                .map_err(db_error)?;
+        }
+        transaction.execute(
             "INSERT INTO uploaded_audio(id,name,format,size,module_path,duration_ms,created_at_ms,is_current) VALUES(?1,?2,?3,?4,?5,?6,?7,1)",
             params![audio.id,audio.name,audio.format,audio.size,audio.module_path,audio.duration_ms,audio.created_at_ms],
         ).map_err(db_error)?;
         transaction.commit().map_err(db_error)
+    }
+
+    pub fn select_audio(&self, id: &str) -> Result<UploadedAudioRecord, ModemError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction().map_err(db_error)?;
+        let exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM uploaded_audio WHERE id=?1)",
+                [id],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        if !exists {
+            return Err(ModemError::Validation("audio file was not found".into()));
+        }
+        transaction
+            .execute(
+                "UPDATE uploaded_audio SET is_current=0 WHERE is_current=1",
+                [],
+            )
+            .map_err(db_error)?;
+        transaction
+            .execute("UPDATE uploaded_audio SET is_current=1 WHERE id=?1", [id])
+            .map_err(db_error)?;
+        transaction.commit().map_err(db_error)?;
+        drop(connection);
+        self.current_audio()?
+            .ok_or_else(|| ModemError::Validation("audio file was not found".into()))
     }
 
     pub fn save_call(&self, call: &CallRecord) -> Result<(), ModemError> {
@@ -509,6 +588,20 @@ fn table_columns(connection: &Connection, table: &str) -> Result<Vec<String>, Mo
         .map_err(db_error)
 }
 
+fn audio_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UploadedAudioRecord> {
+    Ok(UploadedAudioRecord {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        format: row.get(2)?,
+        size: row.get(3)?,
+        module_path: row.get(4)?,
+        duration_ms: row.get(5)?,
+        created_at_ms: row.get(6)?,
+        state: "ready".into(),
+        is_current: row.get(7)?,
+    })
+}
+
 fn db_error(error: impl std::fmt::Display) -> ModemError {
     ModemError::Persistence(error.to_string())
 }
@@ -519,7 +612,7 @@ mod tests {
     #[test]
     fn migrates_and_round_trips_settings() {
         let store = Store::memory().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 5);
+        assert_eq!(store.schema_version().unwrap(), 6);
         let mut expected = Settings::default();
         expected.port_override = Some("COM6".into());
         store.save_settings(&expected, 42).unwrap();
@@ -688,16 +781,30 @@ mod tests {
             duration_ms: 20,
             created_at_ms,
             state: "ready".into(),
+            is_current: false,
         };
         store.save_current_audio(&audio("old", 1)).unwrap();
         store.save_current_audio(&audio("new", 2)).unwrap();
         assert_eq!(store.current_audio().unwrap().unwrap().id, "new");
+        assert_eq!(store.list_audio().unwrap().len(), 2);
+        assert_eq!(store.select_audio("old").unwrap().id, "old");
+
+        let mut replacement = audio("replacement", 3);
+        replacement.name = " OLD.AMR ".into();
+        let replaced = store.audio_named("old.amr").unwrap().unwrap();
+        store
+            .replace_and_select_audio(&replacement, Some(&replaced.id))
+            .unwrap();
+        let library = store.list_audio().unwrap();
+        assert_eq!(library.len(), 2);
+        assert_eq!(library[0].id, "replacement");
+        assert!(library.iter().any(|entry| entry.id == "new"));
 
         let call = CallRecord {
             id: "call".into(),
             peer: "+66000000000".into(),
             state: "playing".into(),
-            audio_id: "new".into(),
+            audio_id: "replacement".into(),
             created_at_ms: 3,
             ..Default::default()
         };

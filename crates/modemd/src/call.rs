@@ -62,7 +62,13 @@ pub fn parse_urc(line: &str) -> Option<CallUrc> {
         "BUSY" => Some(CallUrc::Busy),
         "NO ANSWER" => Some(CallUrc::NoAnswer),
         "NO CARRIER" => Some(CallUrc::NoCarrier),
-        value if value.eq_ignore_ascii_case("+AUDIOSTATE: audio play stop") => {
+        value
+            if value
+                .chars()
+                .filter(|character| !character.is_ascii_whitespace())
+                .collect::<String>()
+                .eq_ignore_ascii_case("+AUDIOSTATE:audioplaystop") =>
+        {
             Some(CallUrc::AudioPlayStop)
         }
         _ => None,
@@ -317,5 +323,16 @@ mod tests {
         }
         assert_eq!(call.classification, AnswerClassification::Answered);
         assert_eq!(call.end_reason, EndReason::RemoteHangUp);
+    }
+
+    #[test]
+    fn audio_stop_accepts_compact_spaced_and_mixed_case_firmware_forms() {
+        for line in [
+            "+AUDIOSTATE:audio playstop",
+            "+AUDIOSTATE: audio play stop",
+            "+audiostate: AuDiO  PLAYstop",
+        ] {
+            assert_eq!(parse_urc(line), Some(CallUrc::AudioPlayStop));
+        }
     }
 }

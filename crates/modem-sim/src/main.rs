@@ -22,10 +22,13 @@ mod windows_sim {
     struct SimState {
         legacy_scenario: CallScenario,
         current_audio: Option<serde_json::Value>,
+        audio: Vec<serde_json::Value>,
+        audio_sequence: u64,
         calls: Vec<serde_json::Value>,
         call_scenario: String,
         polls: u32,
         settings: Option<serde_json::Value>,
+        hang_attempts: u32,
     }
 
     fn json_response(request: &str, state: &mut SimState) -> Option<String> {
@@ -46,6 +49,23 @@ mod windows_sim {
                 serde_json::json!({"ok":true,"data":settings})
             }
             "get_current_audio" => serde_json::json!({"ok":true,"data":state.current_audio}),
+            "list_audio" => serde_json::json!({"ok":true,"data":state.audio}),
+            "select_audio" => {
+                let id = value
+                    .get("audioId")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or_default();
+                if let Some(index) = state.audio.iter().position(|audio| audio["id"] == id) {
+                    for audio in &mut state.audio {
+                        audio["isCurrent"] = false.into();
+                    }
+                    state.audio[index]["isCurrent"] = true.into();
+                    state.current_audio = Some(state.audio[index].clone());
+                    serde_json::json!({"ok":true,"data":state.audio[index]})
+                } else {
+                    serde_json::json!({"ok":false,"error":"audio file was not found"})
+                }
+            }
             "upload_audio" => {
                 let name = value
                     .get("name")
@@ -55,10 +75,21 @@ mod windows_sim {
                     .get("data")
                     .and_then(|x| x.as_array())
                     .map_or(0, Vec::len);
-                let audio = serde_json::json!({
-                    "id":"sim-audio","name":name,"format":"AMR-NB","size":size,
-                    "modulePath":"c:/call_sim-audio.amr","durationMs":2000,"createdAtMs":1785722400000_i64,"state":"ready"
+                state.audio.retain(|audio| {
+                    !audio["name"]
+                        .as_str()
+                        .is_some_and(|old| old.trim().eq_ignore_ascii_case(name.trim()))
                 });
+                for existing in &mut state.audio {
+                    existing["isCurrent"] = false.into();
+                }
+                state.audio_sequence += 1;
+                let id = format!("sim-audio-{}", state.audio_sequence);
+                let audio = serde_json::json!({
+                    "id":id,"name":name,"format":"AMR-NB","size":size,
+                    "modulePath":format!("c:/call_{id}.amr"),"durationMs":2000,"createdAtMs":1785722400000_i64 + state.audio.len() as i64,"state":"ready","isCurrent":true
+                });
+                state.audio.insert(0, audio.clone());
                 state.current_audio = Some(audio.clone());
                 serde_json::json!({"ok":true,"data":audio})
             }
@@ -78,12 +109,19 @@ mod windows_sim {
                         "09" => "early-remote-hang-up",
                         "10" => "manual-cancellation",
                         "11" => "delayed-answer",
+                        "12" => "stuck-release",
                         _ => "success",
                     }
                     .into();
                     state.polls = 0;
+                    state.hang_attempts = 0;
+                    let audio_id = state
+                        .current_audio
+                        .as_ref()
+                        .and_then(|audio| audio["id"].as_str())
+                        .unwrap_or_default();
                     let call = serde_json::json!({
-                        "id":"sim-call","peer":peer,"state":"waiting-for-answer","audioId":"sim-audio",
+                        "id":"sim-call","peer":peer,"state":"waiting-for-answer","audioId":audio_id,
                         "error":"","durationSeconds":0,"createdAtMs":1785722401000_i64,
                         "answerClassification":"unknown","endReason":"none","connectedAtMs":0,
                         "endedAtMs":0,"releaseCause":""
@@ -112,6 +150,12 @@ mod windows_sim {
                                 ("ended", "answered", "remote-hang-up", "")
                             }
                             ("manual-cancellation", 3..) => ("playing", "answered", "none", ""),
+                            ("stuck-release", _) if call["state"] == "hang-up-failed" => (
+                                "hang-up-failed",
+                                "answered",
+                                "none",
+                                "release confirmation timed out",
+                            ),
                             ("delayed-answer", 1..=5) => {
                                 ("waiting-for-answer", "unknown", "none", "")
                             }
@@ -130,9 +174,16 @@ mod windows_sim {
                 serde_json::json!({"ok":true,"data":state.calls})
             }
             "hang_up" => {
+                state.hang_attempts += 1;
                 if let Some(call) = state.calls.first_mut() {
-                    call["state"] = "ended".into();
-                    call["endReason"] = "local-hang-up".into();
+                    if state.call_scenario == "stuck-release" && state.hang_attempts == 1 {
+                        call["state"] = "hang-up-failed".into();
+                        call["error"] = "release confirmation timed out; retry Hang Up".into();
+                    } else {
+                        call["state"] = "ended".into();
+                        call["endReason"] = "local-hang-up".into();
+                        call["error"] = "".into();
+                    }
                 }
                 serde_json::json!({"ok":true,"data":null})
             }

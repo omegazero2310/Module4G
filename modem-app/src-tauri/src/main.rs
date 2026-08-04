@@ -92,7 +92,7 @@ fn suppress_successful_poll_log(request: &str) -> bool {
             value
                 .get("command")
                 .and_then(|command| command.as_str())
-                .map(|command| matches!(command, "list_calls" | "get_current_audio"))
+                .map(|command| matches!(command, "list_calls" | "get_current_audio" | "list_audio"))
         })
         .unwrap_or(false)
 }
@@ -233,6 +233,7 @@ struct UploadedAudio {
     duration_ms: u64,
     created_at_ms: i64,
     state: String,
+    is_current: bool,
 }
 
 impl Default for Record {
@@ -561,6 +562,28 @@ async fn make_call(
 async fn get_current_audio() -> Result<Option<UploadedAudio>, String> {
     request_json(serde_json::json!({"command":"get_current_audio"})).await
 }
+
+#[cfg(windows)]
+#[tauri::command]
+async fn list_audio() -> Result<Vec<UploadedAudio>, String> {
+    request_json(serde_json::json!({"command":"list_audio"})).await
+}
+#[cfg(not(windows))]
+#[tauri::command]
+async fn list_audio() -> Result<Vec<UploadedAudio>, String> {
+    Ok(Vec::new())
+}
+
+#[cfg(windows)]
+#[tauri::command]
+async fn select_audio(audio_id: String) -> Result<UploadedAudio, String> {
+    request_json(serde_json::json!({"command":"select_audio","audioId":audio_id})).await
+}
+#[cfg(not(windows))]
+#[tauri::command]
+async fn select_audio(_audio_id: String) -> Result<UploadedAudio, String> {
+    Err("Audio selection is available only on Windows.".into())
+}
 #[cfg(not(windows))]
 #[tauri::command]
 async fn get_current_audio() -> Result<Option<UploadedAudio>, String> {
@@ -727,6 +750,8 @@ fn main() {
             sync_sms,
             list_sms,
             get_current_audio,
+            list_audio,
+            select_audio,
             upload_audio,
             make_call,
             hang_up,

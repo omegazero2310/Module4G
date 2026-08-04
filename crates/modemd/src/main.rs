@@ -392,6 +392,19 @@ mod windows_host {
                 .current_audio()
                 .map(|audio| serde_json::to_value(audio).unwrap())
                 .map_err(|e| e.to_string()),
+            "list_audio" => call_manager
+                .list_audio()
+                .map(|audio| serde_json::to_value(audio).unwrap())
+                .map_err(|e| e.to_string()),
+            "select_audio" => call_manager
+                .select_audio(
+                    value
+                        .get("audioId")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default(),
+                )
+                .map(|audio| serde_json::to_value(audio).unwrap())
+                .map_err(|e| e.to_string()),
             "upload_audio" => upload_audio_json(value, call_manager)
                 .await
                 .map(|audio| serde_json::to_value(audio).unwrap()),
