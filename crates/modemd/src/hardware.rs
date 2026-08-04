@@ -23,6 +23,7 @@ const RAW_PROMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const RAW_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
 const INTERACTIVE_RESYNC_WINDOW: Duration = Duration::from_millis(300);
 const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 const INITIALIZATION_COMMANDS: &[&str] = &["AT+CMEE=2", "AT+CVHU=0", "AT+CMGF=1"];
 const OPTIONAL_INITIALIZATION_COMMANDS: &[&str] = &[
     "AT+CLCC=1",
@@ -138,8 +139,10 @@ pub fn monitor_with_commands(
     let mut modem: Option<InitializedModem> = None;
     let mut dispatcher = Dispatcher::default();
     let mut last_state: Option<HardwareState> = None;
+    let mut next_health_check = Instant::now();
     while !stop.load(Ordering::Relaxed) {
         if modem.as_ref().is_some_and(InitializedModem::is_present) {
+            let mut connection_failed = false;
             match commands.recv_timeout(Duration::from_millis(100)) {
                 Ok(request) => {
                     let port = modem.as_mut().expect("presence checked").port();
@@ -167,10 +170,21 @@ pub fn monitor_with_commands(
                         })
                     };
                     publish_sms_events(&mut dispatcher, &sms_events);
+                    if result_confirms_liveness(&result) {
+                        next_health_check = Instant::now() + HEALTH_CHECK_INTERVAL;
+                    }
+                    connection_failed = result_requires_reconnect(&result);
                     let _ = request.reply.send(result);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => thread::sleep(DEVICE_POLL_INTERVAL),
+            }
+            if connection_failed {
+                eprintln!("modem command did not respond; closing the COM session for recovery");
+                modem = None;
+                dispatcher.reset();
+                publish_if_changed(&mut last_state, HardwareState::Disconnected, &mut report);
+                continue;
             }
             // The serial actor remains the sole reader even while idle. This
             // prevents unsolicited delivery reports from filling the driver
@@ -181,22 +195,55 @@ pub fn monitor_with_commands(
                     Ok(count) if count > 0 => {
                         let _ = dispatcher.push(&buffer[..count], None);
                         publish_sms_events(&mut dispatcher, &sms_events);
+                        next_health_check = Instant::now() + HEALTH_CHECK_INTERVAL;
                     }
                     Ok(_) => {}
                     Err(error) if error.kind() == io::ErrorKind::TimedOut => {}
                     Err(_) => modem = None,
                 }
             }
+            if modem.is_none() {
+                dispatcher.reset();
+                publish_if_changed(&mut last_state, HardwareState::Disconnected, &mut report);
+                continue;
+            }
+            if modem.is_some() && Instant::now() >= next_health_check {
+                let result = execute_command(
+                    modem.as_mut().expect("presence checked").port(),
+                    "AT",
+                    None,
+                    false,
+                    PROBE_TIMEOUT,
+                    PayloadMode::Sms,
+                    &mut dispatcher,
+                );
+                publish_sms_events(&mut dispatcher, &sms_events);
+                if result_requires_reconnect(&result) {
+                    eprintln!(
+                        "modem health probe did not respond; closing the COM session for recovery"
+                    );
+                    modem = None;
+                    dispatcher.reset();
+                    publish_if_changed(&mut last_state, HardwareState::Disconnected, &mut report);
+                } else {
+                    next_health_check = Instant::now() + HEALTH_CHECK_INTERVAL;
+                }
+            }
             continue;
         }
 
-        modem = None;
+        if modem.take().is_some() {
+            eprintln!("modem COM device became unavailable; reopening the serial session");
+            publish_if_changed(&mut last_state, HardwareState::Disconnected, &mut report);
+        }
+        dispatcher.reset();
         match discover_and_initialize(&settings) {
             Ok(connected) => {
                 let state = HardwareState::Ready {
                     port_name: connected.port_name.clone(),
                 };
                 modem = Some(connected);
+                next_health_check = Instant::now() + HEALTH_CHECK_INTERVAL;
                 publish_if_changed(&mut last_state, state, &mut report);
             }
             Err(HardwareError::PortBusy { port_name, .. }) => publish_if_changed(
@@ -208,6 +255,20 @@ pub fn monitor_with_commands(
         }
         thread::sleep(DEVICE_POLL_INTERVAL);
     }
+}
+
+fn result_confirms_liveness(result: &Result<Vec<String>, ModemError>) -> bool {
+    matches!(result, Ok(_) | Err(ModemError::CommandRejected(_)))
+}
+
+fn result_requires_reconnect(result: &Result<Vec<String>, ModemError>) -> bool {
+    matches!(
+        result,
+        Err(ModemError::Disconnected
+            | ModemError::Timeout
+            | ModemError::SmsSubmitTimeout { .. }
+            | ModemError::RawUploadTimeout { .. })
+    )
 }
 
 fn publish_sms_events(dispatcher: &mut Dispatcher, sender: &mpsc::Sender<SmsUrcEvent>) {
@@ -817,10 +878,17 @@ pub fn discover_and_initialize(settings: &Settings) -> Result<InitializedModem, 
     for candidate in candidates {
         let opened = serialport::new(&candidate.name, settings.baud)
             .timeout(Duration::from_millis(100))
+            .dtr_on_open(true)
             .open();
         let mut port = match opened {
             Ok(port) => port,
-            Err(source) if is_dedicated_at_port(&candidate) => {
+            Err(source)
+                if is_dedicated_at_port(&candidate)
+                    || settings
+                        .port_override
+                        .as_deref()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(&candidate.name)) =>
+            {
                 return Err(HardwareError::PortBusy {
                     port_name: candidate.name,
                     source,
@@ -1126,6 +1194,34 @@ mod tests {
                 "AT+CSDH=1"
             ]
         );
+    }
+
+    #[test]
+    fn response_timeouts_force_a_fresh_serial_session() {
+        for error in [
+            ModemError::Disconnected,
+            ModemError::Timeout,
+            ModemError::SmsSubmitTimeout {
+                phase: "test",
+                resynchronized: true,
+            },
+            ModemError::RawUploadTimeout {
+                phase: RawUploadTimeoutPhase::Prompt,
+                bytes_sent: 0,
+                chunks_sent: 0,
+                pacing_ms: 0,
+                elapsed_ms: 1,
+                resynchronized: true,
+            },
+        ] {
+            assert!(result_requires_reconnect(&Err(error)));
+        }
+        assert!(!result_requires_reconnect(&Err(
+            ModemError::CommandRejected("ERROR".into())
+        )));
+        assert!(result_confirms_liveness(&Err(ModemError::CommandRejected(
+            "ERROR".into()
+        ))));
     }
 
     #[test]
