@@ -25,7 +25,9 @@ const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const INITIALIZATION_COMMANDS: &[&str] = &["AT+CMEE=2", "AT+CVHU=0", "AT+CMGF=1"];
 const OPTIONAL_INITIALIZATION_COMMANDS: &[&str] = &[
     "AT+CLCC=1",
-    "AT+CNMI=2,1,0,1,0",
+    // Select SIM storage before enabling stored-message and stored-report URCs.
+    "AT+CPMS=\"SM\",\"SM\",\"SM\"",
+    "AT+CNMI=2,1,0,2,0",
     // TP-SRR requests a network delivery report for SMS-SUBMIT messages.
     "AT+CSMP=49,167,0,0",
     "AT+CSDH=1",
@@ -940,7 +942,8 @@ mod tests {
             OPTIONAL_INITIALIZATION_COMMANDS,
             [
                 "AT+CLCC=1",
-                "AT+CNMI=2,1,0,1,0",
+                "AT+CPMS=\"SM\",\"SM\",\"SM\"",
+                "AT+CNMI=2,1,0,2,0",
                 "AT+CSMP=49,167,0,0",
                 "AT+CSDH=1"
             ]

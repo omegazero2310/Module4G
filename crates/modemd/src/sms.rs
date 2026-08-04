@@ -412,14 +412,18 @@ fn decode_timestamp(raw: &[u8]) -> String {
     if raw.len() != 7 {
         return String::new();
     }
+    let negative = raw[6] & 0x08 != 0;
+    let timezone = pair(raw[6] & !0x08);
     format!(
-        "{:02}/{:02}/{:02},{:02}:{:02}:{:02}",
+        "{:02}/{:02}/{:02},{:02}:{:02}:{:02}{}{:02}",
         pair(raw[0]),
         pair(raw[1]),
         pair(raw[2]),
         pair(raw[3]),
         pair(raw[4]),
-        pair(raw[5])
+        pair(raw[5]),
+        if negative { '-' } else { '+' },
+        timezone,
     )
 }
 fn decode_hex(s: &str) -> Option<Vec<u8>> {

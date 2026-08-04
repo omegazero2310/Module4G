@@ -206,6 +206,14 @@ impl Store {
              CREATE UNIQUE INDEX IF NOT EXISTS uploaded_audio_name_nocase ON uploaded_audio(lower(trim(name)));
              INSERT OR IGNORE INTO schema_migrations(version) VALUES (6);",
         ).map_err(db_error)?;
+        connection.execute_batch(
+            "DELETE FROM sms_parts WHERE NOT EXISTS(SELECT 1 FROM schema_migrations WHERE version=7);
+             DELETE FROM sms WHERE NOT EXISTS(SELECT 1 FROM schema_migrations WHERE version=7);
+             UPDATE balance_checks SET sms_id='' WHERE NOT EXISTS(SELECT 1 FROM schema_migrations WHERE version=7);
+             DROP INDEX IF EXISTS sms_sim_fingerprint;
+             CREATE UNIQUE INDEX sms_sim_fingerprint ON sms(storage,fingerprint) WHERE source='sim';
+             INSERT OR IGNORE INTO schema_migrations(version) VALUES (7);",
+        ).map_err(db_error)?;
         Ok(())
     }
 
@@ -388,8 +396,15 @@ impl Store {
         ).map_err(db_error)
     }
 
+    pub fn recover_interrupted_sms(&self) -> Result<usize, ModemError> {
+        self.connection()?.execute(
+            "UPDATE sms SET state='send-unknown',cause='daemon restarted while modem acceptance was unknown' WHERE state='sending'",
+            [],
+        ).map_err(db_error)
+    }
+
     pub fn save_sms(&self, r: &SmsRecord) -> Result<(), ModemError> {
-        self.connection()?.execute("INSERT INTO sms(id,direction,peer,body,state,message_reference,cause,created_at_ms,kind,source,storage,storage_index,modem_status,modem_timestamp,encoding,dcs,length,service_center,delivery_status,synchronized_at_ms,present_on_modem,fingerprint,storage_indices,part_count,parts_received,multipart_complete) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26) ON CONFLICT(id) DO UPDATE SET state=excluded.state,delivery_status=excluded.delivery_status,synchronized_at_ms=excluded.synchronized_at_ms,present_on_modem=excluded.present_on_modem",params![r.id,r.direction,r.peer,r.body,r.state,r.message_reference,r.cause,r.created_at_ms,r.kind,r.source,r.storage,r.storage_index,r.modem_status,r.modem_timestamp,r.encoding,r.dcs,r.length,r.service_center,r.delivery_status,r.synchronized_at_ms,r.present_on_modem,r.fingerprint,serde_json::to_string(&r.storage_indices).map_err(db_error)?,r.part_count,r.parts_received,r.multipart_complete]).map_err(db_error)?;
+        self.connection()?.execute("INSERT INTO sms(id,direction,peer,body,state,message_reference,cause,created_at_ms,kind,source,storage,storage_index,modem_status,modem_timestamp,encoding,dcs,length,service_center,delivery_status,synchronized_at_ms,present_on_modem,fingerprint,storage_indices,part_count,parts_received,multipart_complete) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26) ON CONFLICT(id) DO UPDATE SET state=excluded.state,message_reference=excluded.message_reference,cause=excluded.cause,delivery_status=excluded.delivery_status,synchronized_at_ms=excluded.synchronized_at_ms,present_on_modem=excluded.present_on_modem",params![r.id,r.direction,r.peer,r.body,r.state,r.message_reference,r.cause,r.created_at_ms,r.kind,r.source,r.storage,r.storage_index,r.modem_status,r.modem_timestamp,r.encoding,r.dcs,r.length,r.service_center,r.delivery_status,r.synchronized_at_ms,r.present_on_modem,r.fingerprint,serde_json::to_string(&r.storage_indices).map_err(db_error)?,r.part_count,r.parts_received,r.multipart_complete]).map_err(db_error)?;
         Ok(())
     }
     pub fn sync_sms(&self, records: &[SmsRecord], now: i64) -> Result<(), ModemError> {
@@ -398,8 +413,14 @@ impl Store {
         tx.execute("UPDATE sms SET present_on_modem=0,synchronized_at_ms=?1 WHERE source='sim' AND storage='SM'",[now]).map_err(db_error)?;
         for r in records {
             let indices = serde_json::to_string(&r.storage_indices).map_err(db_error)?;
-            tx.execute("INSERT INTO sms(id,direction,peer,body,state,message_reference,cause,created_at_ms,kind,source,storage,storage_index,modem_status,modem_timestamp,encoding,dcs,length,service_center,delivery_status,synchronized_at_ms,present_on_modem,fingerprint,storage_indices,part_count,parts_received,multipart_complete,superseded) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,1,?21,?22,?23,?24,?25,0) ON CONFLICT(storage,storage_index,fingerprint) WHERE source='sim' DO UPDATE SET direction=excluded.direction,peer=excluded.peer,body=excluded.body,state=excluded.state,kind=excluded.kind,modem_status=excluded.modem_status,modem_timestamp=excluded.modem_timestamp,encoding=excluded.encoding,dcs=excluded.dcs,length=excluded.length,service_center=excluded.service_center,delivery_status=excluded.delivery_status,synchronized_at_ms=excluded.synchronized_at_ms,present_on_modem=1,storage_indices=excluded.storage_indices,part_count=excluded.part_count,parts_received=excluded.parts_received,multipart_complete=excluded.multipart_complete,superseded=0",params![r.id,r.direction,r.peer,r.body,r.state,r.message_reference,r.cause,r.created_at_ms,r.kind,r.source,r.storage,r.storage_index,r.modem_status,r.modem_timestamp,r.encoding,r.dcs,r.length,r.service_center,r.delivery_status,now,r.fingerprint,indices,r.part_count,r.parts_received,r.multipart_complete]).map_err(db_error)?;
-            let logical_id:String=tx.query_row("SELECT id FROM sms WHERE source='sim' AND storage=?1 AND storage_index=?2 AND fingerprint=?3",params![r.storage,r.storage_index,r.fingerprint],|row|row.get(0)).map_err(db_error)?;
+            tx.execute("INSERT INTO sms(id,direction,peer,body,state,message_reference,cause,created_at_ms,kind,source,storage,storage_index,modem_status,modem_timestamp,encoding,dcs,length,service_center,delivery_status,synchronized_at_ms,present_on_modem,fingerprint,storage_indices,part_count,parts_received,multipart_complete,superseded) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,1,?21,?22,?23,?24,?25,0) ON CONFLICT(storage,fingerprint) WHERE source='sim' DO UPDATE SET direction=excluded.direction,peer=excluded.peer,body=excluded.body,state=excluded.state,kind=excluded.kind,storage_index=excluded.storage_index,modem_status=excluded.modem_status,modem_timestamp=excluded.modem_timestamp,encoding=excluded.encoding,dcs=excluded.dcs,length=excluded.length,service_center=excluded.service_center,delivery_status=excluded.delivery_status,synchronized_at_ms=excluded.synchronized_at_ms,present_on_modem=1,storage_indices=excluded.storage_indices,part_count=excluded.part_count,parts_received=excluded.parts_received,multipart_complete=excluded.multipart_complete,superseded=0",params![r.id,r.direction,r.peer,r.body,r.state,r.message_reference,r.cause,r.created_at_ms,r.kind,r.source,r.storage,r.storage_index,r.modem_status,r.modem_timestamp,r.encoding,r.dcs,r.length,r.service_center,r.delivery_status,now,r.fingerprint,indices,r.part_count,r.parts_received,r.multipart_complete]).map_err(db_error)?;
+            let logical_id: String = tx
+                .query_row(
+                    "SELECT id FROM sms WHERE source='sim' AND storage=?1 AND fingerprint=?2",
+                    params![r.storage, r.fingerprint],
+                    |row| row.get(0),
+                )
+                .map_err(db_error)?;
             tx.execute("DELETE FROM sms_parts WHERE logical_id=?1", [&logical_id])
                 .map_err(db_error)?;
             for (index, payload) in r.storage_indices.iter().zip(&r.part_payloads) {
@@ -415,11 +436,12 @@ impl Store {
             reconcile_legacy_parts(&tx, r, &logical_id)?;
         }
         apply_delivery_reports(&tx, records)?;
+        reconcile_stored_submissions(&tx, records)?;
         tx.commit().map_err(db_error)
     }
     pub fn list_sms(&self, limit: usize) -> Result<Vec<SmsRecord>, ModemError> {
         let c = self.connection()?;
-        let mut s=c.prepare("SELECT id,direction,peer,body,state,message_reference,cause,created_at_ms,kind,source,storage,storage_index,modem_status,modem_timestamp,encoding,dcs,length,service_center,delivery_status,synchronized_at_ms,present_on_modem,fingerprint,storage_indices,part_count,parts_received,multipart_complete FROM sms WHERE superseded=0 ORDER BY created_at_ms DESC,id DESC LIMIT ?1").map_err(db_error)?;
+        let mut s=c.prepare("SELECT id,direction,peer,body,state,message_reference,cause,created_at_ms,kind,source,storage,storage_index,modem_status,modem_timestamp,encoding,dcs,length,service_center,delivery_status,synchronized_at_ms,present_on_modem,fingerprint,storage_indices,part_count,parts_received,multipart_complete FROM sms WHERE superseded=0 AND kind<>'status-report' ORDER BY created_at_ms DESC,storage_index DESC,id DESC LIMIT ?1").map_err(db_error)?;
         s.query_map([limit as i64], |r| {
             Ok(SmsRecord {
                 id: r.get(0)?,
@@ -553,13 +575,72 @@ fn apply_delivery_reports(
             && !record.message_reference.is_empty()
     }) {
         let state = delivery_state(&report.delivery_status);
-        tx.execute(
-            "UPDATE sms SET state=?1,delivery_status=?2 WHERE id=(SELECT id FROM sms WHERE direction='outbound' AND peer=?3 AND message_reference=?4 AND kind<>'status-report' ORDER BY created_at_ms DESC,id DESC LIMIT 1)",
-            params![state, report.delivery_status, report.peer, report.message_reference],
-        )
-        .map_err(db_error)?;
+        let mut statement = tx.prepare(
+            "SELECT id,peer FROM sms WHERE direction='outbound' AND message_reference=?1 AND kind<>'status-report' ORDER BY created_at_ms DESC,id DESC",
+        ).map_err(db_error)?;
+        let candidates = statement
+            .query_map([&report.message_reference], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(db_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_error)?;
+        drop(statement);
+        if let Some((id, _)) = candidates
+            .into_iter()
+            .find(|(_, peer)| normalize_peer(peer) == normalize_peer(&report.peer))
+        {
+            tx.execute(
+                "UPDATE sms SET state=?1,delivery_status=?2 WHERE id=?3",
+                params![state, report.delivery_status, id],
+            )
+            .map_err(db_error)?;
+        }
     }
     Ok(())
+}
+
+fn reconcile_stored_submissions(
+    tx: &rusqlite::Transaction<'_>,
+    records: &[SmsRecord],
+) -> Result<(), ModemError> {
+    for stored in records.iter().filter(|record| {
+        record.direction == "outbound"
+            && record.modem_status == "STO SENT"
+            && !record.body.is_empty()
+    }) {
+        let normalized_peer = normalize_peer(&stored.peer);
+        let mut statement = tx.prepare(
+            "SELECT id,peer FROM sms WHERE source='app' AND direction='outbound' AND body=?1 AND (?2='' OR message_reference=?2) ORDER BY created_at_ms DESC,id DESC",
+        ).map_err(db_error)?;
+        let candidates = statement
+            .query_map(params![stored.body, stored.message_reference], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(db_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_error)?;
+        drop(statement);
+        if let Some((app_id, _)) = candidates
+            .into_iter()
+            .find(|(_, peer)| normalize_peer(peer) == normalized_peer)
+        {
+            tx.execute(
+                "UPDATE sms SET superseded=1 WHERE source='sim' AND storage=?1 AND storage_index=?2 AND fingerprint=?3",
+                params![stored.storage, stored.storage_index, stored.fingerprint],
+            ).map_err(db_error)?;
+            tx.execute(
+                "UPDATE sms SET modem_status=?1,synchronized_at_ms=?2,present_on_modem=1 WHERE id=?3",
+                params![stored.modem_status, stored.synchronized_at_ms, app_id],
+            ).map_err(db_error)?;
+        }
+    }
+    Ok(())
+}
+
+fn normalize_peer(value: &str) -> String {
+    let digits: String = value.chars().filter(char::is_ascii_digit).collect();
+    digits.strip_prefix("00").unwrap_or(&digits).to_owned()
 }
 
 fn delivery_state(status: &str) -> &'static str {
@@ -612,7 +693,7 @@ mod tests {
     #[test]
     fn migrates_and_round_trips_settings() {
         let store = Store::memory().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 6);
+        assert_eq!(store.schema_version().unwrap(), 7);
         let mut expected = Settings::default();
         expected.port_override = Some("COM6".into());
         store.save_settings(&expected, 42).unwrap();
@@ -639,6 +720,130 @@ mod tests {
         let x = s.list_sms(10).unwrap();
         assert_eq!(x.len(), 2);
         assert_eq!(x.iter().filter(|r| r.present_on_modem).count(), 1);
+    }
+    #[test]
+    fn read_state_transition_updates_the_canonical_row() {
+        let store = Store::memory().unwrap();
+        let mut record = SmsRecord {
+            id: "unread".into(),
+            source: "sim".into(),
+            storage: "SM".into(),
+            storage_index: 4,
+            fingerprint: "immutable".into(),
+            state: "unread".into(),
+            modem_status: "REC UNREAD".into(),
+            storage_indices: vec![4],
+            ..Default::default()
+        };
+        store.sync_sms(&[record.clone()], 1).unwrap();
+        record.id = "read-refresh".into();
+        record.state = "read".into();
+        record.modem_status = "REC READ".into();
+        store.sync_sms(&[record], 2).unwrap();
+        let rows = store.list_sms(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, "read");
+        assert_eq!(rows[0].modem_status, "REC READ");
+    }
+
+    #[test]
+    fn stored_sent_copy_is_suppressed_in_favor_of_app_submission() {
+        let store = Store::memory().unwrap();
+        store
+            .save_sms(&SmsRecord {
+                id: "app".into(),
+                direction: "outbound".into(),
+                peer: "+66812345678".into(),
+                body: "hello".into(),
+                state: "submitted".into(),
+                message_reference: "42".into(),
+                kind: "submitted".into(),
+                source: "app".into(),
+                created_at_ms: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .sync_sms(
+                &[SmsRecord {
+                    id: "copy".into(),
+                    direction: "outbound".into(),
+                    peer: "+66812345678".into(),
+                    body: "hello".into(),
+                    state: "submitted".into(),
+                    message_reference: "42".into(),
+                    kind: "stored".into(),
+                    source: "sim".into(),
+                    storage: "SM".into(),
+                    storage_index: 5,
+                    storage_indices: vec![5],
+                    modem_status: "STO SENT".into(),
+                    fingerprint: "copy".into(),
+                    ..Default::default()
+                }],
+                20,
+            )
+            .unwrap();
+        let rows = store.list_sms(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "app");
+        assert!(rows[0].present_on_modem);
+    }
+
+    #[test]
+    fn startup_recovery_marks_sending_as_unknown() {
+        let store = Store::memory().unwrap();
+        store
+            .save_sms(&SmsRecord {
+                id: "attempt".into(),
+                state: "sending".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(store.recover_interrupted_sms().unwrap(), 1);
+        assert_eq!(store.list_sms(1).unwrap()[0].state, "send-unknown");
+    }
+
+    #[test]
+    fn sms_reset_migration_preserves_balance_calls_and_audio() {
+        let store = Store::memory().unwrap();
+        store
+            .save_sms(&SmsRecord {
+                id: "old-sms".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .save_balance(&BalanceRecord {
+                id: "balance".into(),
+                sms_id: "old-sms".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .save_call(&CallRecord {
+                id: "call".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .save_current_audio(&UploadedAudioRecord {
+                id: "audio".into(),
+                name: "call.amr".into(),
+                module_path: "call.amr".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .connection()
+            .unwrap()
+            .execute("DELETE FROM schema_migrations WHERE version=7", [])
+            .unwrap();
+        store.migrate().unwrap();
+        assert!(store.list_sms(10).unwrap().is_empty());
+        assert_eq!(store.list_balances(10).unwrap()[0].sms_id, "");
+        assert_eq!(store.list_calls(10).unwrap().len(), 1);
+        assert_eq!(store.list_audio().unwrap().len(), 1);
     }
     #[test]
     fn balance_links_sms() {
@@ -710,6 +915,36 @@ mod tests {
     }
 
     #[test]
+    fn multipart_identity_survives_newly_discovered_fragments() {
+        let store = Store::memory().unwrap();
+        let mut record = SmsRecord {
+            id: "partial".into(),
+            source: "sim".into(),
+            storage: "SM".into(),
+            storage_index: 8,
+            storage_indices: vec![8],
+            fingerprint: "concat-9".into(),
+            body: "two".into(),
+            part_count: 2,
+            parts_received: 1,
+            multipart_complete: false,
+            ..Default::default()
+        };
+        store.sync_sms(&[record.clone()], 1).unwrap();
+        record.id = "complete".into();
+        record.storage_index = 7;
+        record.storage_indices = vec![7, 8];
+        record.body = "onetwo".into();
+        record.parts_received = 2;
+        record.multipart_complete = true;
+        store.sync_sms(&[record], 2).unwrap();
+        let rows = store.list_sms(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].body, "onetwo");
+        assert!(rows[0].multipart_complete);
+    }
+
+    #[test]
     fn delivery_reports_update_latest_matching_outbound_message() {
         let s = Store::memory().unwrap();
         s.save_sms(&SmsRecord {
@@ -743,6 +978,7 @@ mod tests {
             ..Default::default()
         };
         s.sync_sms(&[report("pending", 1, "0x20")], 20).unwrap();
+        assert_eq!(s.list_sms(10).unwrap().len(), 1);
         assert_eq!(
             s.list_sms(10)
                 .unwrap()

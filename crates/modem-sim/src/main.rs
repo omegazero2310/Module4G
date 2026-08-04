@@ -29,6 +29,45 @@ mod windows_sim {
         polls: u32,
         settings: Option<serde_json::Value>,
         hang_attempts: u32,
+        sms: Vec<serde_json::Value>,
+        sms_polls: u32,
+    }
+
+    fn advance_calls(state: &mut SimState) {
+        state.polls += 1;
+        if let Some(call) = state.calls.first_mut() {
+            let (status, answer, reason, error) = match (state.call_scenario.as_str(), state.polls)
+            {
+                ("no-answer", 3..) => ("ended", "not-answered", "no-answer", ""),
+                ("busy", 2..) => ("ended", "not-answered", "busy", ""),
+                ("playback-failure", 4..) => {
+                    ("failed", "answered", "call-error", "playback start failed")
+                }
+                ("missing-completion", 10..) => (
+                    "failed",
+                    "answered",
+                    "call-error",
+                    "playback completion timed out",
+                ),
+                ("early-remote-hang-up", 2..) => ("ended", "answered", "remote-hang-up", ""),
+                ("manual-cancellation", 3..) => ("playing", "answered", "none", ""),
+                ("stuck-release", _) if call["state"] == "hang-up-failed" => (
+                    "hang-up-failed",
+                    "answered",
+                    "none",
+                    "release confirmation timed out",
+                ),
+                ("delayed-answer", 1..=5) => ("waiting-for-answer", "unknown", "none", ""),
+                (_, 1) => ("playback-delay", "answered", "none", ""),
+                (_, poll) if (2..=4).contains(&poll) => ("playing", "answered", "none", ""),
+                (_, poll) if poll >= 5 => ("ended", "answered", "local-hang-up", ""),
+                _ => ("waiting-for-answer", "unknown", "none", ""),
+            };
+            call["state"] = status.into();
+            call["answerClassification"] = answer.into();
+            call["endReason"] = reason.into();
+            call["error"] = error.into();
+        }
     }
 
     fn json_response(request: &str, state: &mut SimState) -> Option<String> {
@@ -50,6 +89,10 @@ mod windows_sim {
             }
             "get_current_audio" => serde_json::json!({"ok":true,"data":state.current_audio}),
             "list_audio" => serde_json::json!({"ok":true,"data":state.audio}),
+            "get_call_data" => {
+                advance_calls(state);
+                serde_json::json!({"ok":true,"data":{"calls":state.calls,"audio":state.audio}})
+            }
             "select_audio" => {
                 let id = value
                     .get("audioId")
@@ -187,9 +230,123 @@ mod windows_sim {
                 }
                 serde_json::json!({"ok":true,"data":null})
             }
+            "send_sms" => {
+                let peer = value
+                    .get("destination")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or_default();
+                let body = value
+                    .get("body")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or_default();
+                let state_name = if peer.ends_with("91") {
+                    "send-failed"
+                } else if peer.ends_with("92") {
+                    "send-unknown"
+                } else {
+                    "submitted"
+                };
+                let record = sms_record(
+                    &format!("sim-sms-{}", state.sms.len() + 1),
+                    "outbound",
+                    peer,
+                    body,
+                    state_name,
+                    "submitted",
+                    "app",
+                    "42",
+                    "",
+                    1785726000000,
+                );
+                state.sms.insert(0, record.clone());
+                if state_name == "submitted" {
+                    serde_json::json!({"ok":true,"data":record})
+                } else {
+                    serde_json::json!({"ok":false,"error":if state_name=="send-failed"{"modem rejected command: +CMS ERROR: 500"}else{"modem command timed out; send result unknown"}})
+                }
+            }
+            "sync_sms" => {
+                state.sms_polls += 1;
+                for sms in &mut state.sms {
+                    if sms["state"] == "unread" {
+                        sms["state"] = "read".into();
+                        sms["modemStatus"] = "REC READ".into();
+                    }
+                    if sms["state"] == "submitted" && state.sms_polls >= 1 {
+                        sms["state"] = "delivery-pending".into();
+                        sms["deliveryStatus"] = "0x20".into();
+                    }
+                    if sms["state"] == "delivery-pending" && state.sms_polls >= 2 {
+                        sms["state"] = if sms["peer"]
+                            .as_str()
+                            .is_some_and(|peer| peer.ends_with("94"))
+                        {
+                            "delivery-failed".into()
+                        } else {
+                            "delivered".into()
+                        };
+                        sms["deliveryStatus"] = if sms["state"] == "delivered" {
+                            "0x00".into()
+                        } else {
+                            "0x40".into()
+                        };
+                    }
+                }
+                serde_json::json!({"ok":true,"data":{"count":state.sms.len()}})
+            }
+            "list_sms" => {
+                if state.sms.is_empty() {
+                    state.sms.push(sms_record(
+                        "sim-volte",
+                        "inbound",
+                        "191",
+                        "Quy khach da dang ky thanh cong dich vu VoLTE",
+                        "unread",
+                        "received",
+                        "sim",
+                        "",
+                        "26/08/03,10:00:00+28",
+                        1785726000000,
+                    ));
+                }
+                serde_json::json!({"ok":true,"data":state.sms})
+            }
+            "check_balance" => {
+                let sms = sms_record(
+                    "sim-balance-sms",
+                    "inbound",
+                    "191",
+                    "TK goc: 85.500d; tai khoan khuyen mai: 89.174d",
+                    "unread",
+                    "received",
+                    "sim",
+                    "",
+                    "26/08/03,10:01:00+28",
+                    1785726060000,
+                );
+                if !state.sms.iter().any(|item| item["id"] == "sim-balance-sms") {
+                    state.sms.insert(0, sms);
+                }
+                serde_json::json!({"ok":true,"data":{"id":"balance-1","raw":"TK goc: 85.500d; tai khoan khuyen mai: 89.174d","value":null,"currency":"","error":"","createdAtMs":1785726060000_i64,"smsId":"sim-balance-sms"}})
+            }
             _ => return None,
         };
         Some(result.to_string() + "\n")
+    }
+
+    fn sms_record(
+        id: &str,
+        direction: &str,
+        peer: &str,
+        body: &str,
+        state: &str,
+        kind: &str,
+        source: &str,
+        message_reference: &str,
+        modem_timestamp: &str,
+        created_at_ms: i64,
+    ) -> serde_json::Value {
+        serde_json::json!({"id":id,"direction":direction,"peer":peer,"body":body,"state":state,"detail":"","createdAtMs":created_at_ms,"answerClassification":"","endReason":"","releaseCause":"","kind":kind,"source":source,"storage":if source=="sim"{"SM"}else{""},"storageIndex":if source=="sim"{1}else{-1},"storageIndices":if source=="sim"{vec![1]}else{vec![]},"partCount":1,"partsReceived":1,"multipartComplete":true,"modemStatus":if state=="unread"{"REC UNREAD"}else{""},"modemTimestamp":modem_timestamp,"encoding":"GSM-7","dcs":0,"length":body.chars().count(),"serviceCenter":"","messageReference":message_reference,"deliveryStatus":"","synchronizedAtMs":created_at_ms,"presentOnModem":source=="sim","smsId":"","audioId":"","error":"","durationSeconds":0,"connectedAtMs":0,"endedAtMs":0})
     }
 
     fn response(command: &str, scenario: &mut CallScenario) -> &'static str {

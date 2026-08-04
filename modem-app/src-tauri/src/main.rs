@@ -1,9 +1,12 @@
 use modemd::{at::validate_console, settings::Settings as CoreSettings};
 use serde::{Deserialize, Serialize};
 use std::{
-    sync::Mutex,
+    sync::{Mutex, OnceLock},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(windows)]
+static PIPE_REQUEST_GATE: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 fn log_event(area: &str, message: impl AsRef<str>) {
     let elapsed = SystemTime::now()
@@ -92,7 +95,12 @@ fn suppress_successful_poll_log(request: &str) -> bool {
             value
                 .get("command")
                 .and_then(|command| command.as_str())
-                .map(|command| matches!(command, "list_calls" | "get_current_audio" | "list_audio"))
+                .map(|command| {
+                    matches!(
+                        command,
+                        "list_calls" | "get_current_audio" | "list_audio" | "get_call_data"
+                    )
+                })
         })
         .unwrap_or(false)
 }
@@ -236,6 +244,13 @@ struct UploadedAudio {
     is_current: bool,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CallData {
+    calls: Vec<Record>,
+    audio: Vec<UploadedAudio>,
+}
+
 impl Default for Record {
     fn default() -> Self {
         Self {
@@ -286,6 +301,10 @@ async fn request_line(request: &str) -> Result<String, String> {
     let display_request = logged_request(request);
     let started = Instant::now();
     let suppress_success = suppress_successful_poll_log(request);
+    let _request_guard = PIPE_REQUEST_GATE
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
     if !suppress_success {
         log_event("APP -> SERVICE", &display_request);
     }
@@ -568,6 +587,20 @@ async fn get_current_audio() -> Result<Option<UploadedAudio>, String> {
 async fn list_audio() -> Result<Vec<UploadedAudio>, String> {
     request_json(serde_json::json!({"command":"list_audio"})).await
 }
+
+#[cfg(windows)]
+#[tauri::command]
+async fn get_call_data() -> Result<CallData, String> {
+    request_json(serde_json::json!({"command":"get_call_data"})).await
+}
+#[cfg(not(windows))]
+#[tauri::command]
+async fn get_call_data() -> Result<CallData, String> {
+    Ok(CallData {
+        calls: Vec::new(),
+        audio: Vec::new(),
+    })
+}
 #[cfg(not(windows))]
 #[tauri::command]
 async fn list_audio() -> Result<Vec<UploadedAudio>, String> {
@@ -751,6 +784,7 @@ fn main() {
             list_sms,
             get_current_audio,
             list_audio,
+            get_call_data,
             select_audio,
             upload_audio,
             make_call,

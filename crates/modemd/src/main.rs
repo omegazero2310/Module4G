@@ -139,6 +139,7 @@ mod windows_host {
         let _ = store
             .recover_interrupted_calls(now())
             .map_err(io::Error::other)?;
+        let _ = store.recover_interrupted_sms().map_err(io::Error::other)?;
         let settings = Arc::new(RwLock::new(
             store.load_settings().map_err(io::Error::other)?,
         ));
@@ -284,7 +285,10 @@ mod windows_host {
                     (_, None) => "ERROR: invalid SMS payload\n".into(),
                 }
             } else if request == "BALANCE" {
-                check_viettel_balance(&command_tx).await
+                match check_viettel_balance(&command_tx, &store).await {
+                    Ok((body, _)) => format!("{body}\n"),
+                    Err(error) => format!("ERROR: {error}\n"),
+                }
             } else if let Some(code) = request.strip_prefix("USSD|") {
                 if code.is_empty() || code.len() > 64 {
                     "ERROR: invalid USSD code\n".into()
@@ -395,6 +399,14 @@ mod windows_host {
             "list_audio" => call_manager
                 .list_audio()
                 .map(|audio| serde_json::to_value(audio).unwrap())
+                .map_err(|e| e.to_string()),
+            "get_call_data" => call_manager
+                .list_calls(1000)
+                .and_then(|calls| {
+                    call_manager
+                        .list_audio()
+                        .map(|audio| serde_json::json!({"calls": calls, "audio": audio}))
+                })
                 .map_err(|e| e.to_string()),
             "select_audio" => call_manager
                 .select_audio(
@@ -511,23 +523,12 @@ mod windows_host {
             .unwrap_or_default()
             .to_owned();
         modemd::sms::validate_body(&body).map_err(|e| e.to_string())?;
-        let lines = actor_lines(
-            tx,
-            format!("AT+CMGS=\"{peer}\""),
-            Some(body.clone().into_bytes()),
-        )
-        .await?;
-        let mr = lines
-            .iter()
-            .find_map(|x| x.strip_prefix("+CMGS:").map(|v| v.trim().to_owned()))
-            .unwrap_or_default();
-        let r = SmsRecord {
+        let mut record = SmsRecord {
             id: ulid::Ulid::new().to_string(),
             direction: "outbound".into(),
-            peer,
+            peer: peer.clone(),
             body: body.clone(),
-            state: "submitted".into(),
-            message_reference: mr,
+            state: "sending".into(),
             created_at_ms: now(),
             kind: "submitted".into(),
             source: "app".into(),
@@ -536,10 +537,53 @@ mod windows_host {
             multipart_complete: true,
             encoding: modemd::sms::validate_body(&body).unwrap_or("").into(),
             length: body.chars().count() as i32,
+            storage_index: -1,
             ..Default::default()
         };
-        store.save_sms(&r).map_err(|e| e.to_string())?;
-        Ok(r)
+        store.save_sms(&record).map_err(|e| e.to_string())?;
+        let result = actor_lines(
+            tx,
+            format!("AT+CMGS=\"{peer}\""),
+            Some(body.clone().into_bytes()),
+        )
+        .await;
+        let lines = match result {
+            Ok(lines) => lines,
+            Err(error) => {
+                record.state = if is_explicit_send_rejection(&error) {
+                    "send-failed"
+                } else {
+                    "send-unknown"
+                }
+                .into();
+                record.cause = error.clone();
+                store.save_sms(&record).map_err(|e| e.to_string())?;
+                return Err(error);
+            }
+        };
+        let mr = lines
+            .iter()
+            .find_map(|x| x.strip_prefix("+CMGS:").map(|v| v.trim().to_owned()))
+            .unwrap_or_default();
+        if mr.is_empty() {
+            record.state = "send-unknown".into();
+            record.cause = "modem returned OK without a +CMGS message reference".into();
+            store.save_sms(&record).map_err(|e| e.to_string())?;
+            return Err(record.cause.clone());
+        }
+        record.state = "submitted".into();
+        record.message_reference = mr;
+        record.cause.clear();
+        store.save_sms(&record).map_err(|e| e.to_string())?;
+        Ok(record)
+    }
+
+    fn is_explicit_send_rejection(error: &str) -> bool {
+        let upper = error.to_ascii_uppercase();
+        upper.contains("COMMAND REJECTED")
+            || upper.contains("+CMS ERROR")
+            || upper.contains("+CME ERROR")
+            || upper.trim_end().ends_with("ERROR")
     }
     async fn actor_lines(
         tx: &mpsc::Sender<hardware::AtRequest>,
@@ -568,21 +612,32 @@ mod windows_host {
         store: &Store,
     ) -> Result<usize, String> {
         let lines = actor_pdu_snapshot(tx).await?;
-        let parsed = modemd::sms::parse_cmgl(&lines);
         let stamp = now();
-        let records = parsed
+        let records = snapshot_records(modemd::sms::parse_cmgl(&lines), stamp);
+        store.sync_sms(&records, stamp).map_err(|e| e.to_string())?;
+        Ok(records.len())
+    }
+
+    fn snapshot_records(parsed: Vec<modemd::sms::SimSms>, stamp: i64) -> Vec<SmsRecord> {
+        parsed
             .into_iter()
             .map(|x| {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
+                let single_sim_identity = (x.part_count == 1).then_some(x.index);
+                let immutable_body = (x.part_count == 1).then_some(x.body.as_str());
                 (
-                    x.index,
-                    &x.modem_status,
+                    single_sim_identity,
+                    &x.direction,
                     &x.peer,
-                    &x.body,
+                    immutable_body,
                     &x.modem_timestamp,
+                    &x.kind,
+                    &x.message_reference,
+                    &x.delivery_status,
                 )
                     .hash(&mut h);
+                let created_at_ms = modem_timestamp_ms(&x.modem_timestamp).unwrap_or(stamp);
                 SmsRecord {
                     id: ulid::Ulid::new().to_string(),
                     direction: x.direction,
@@ -591,13 +646,13 @@ mod windows_host {
                     state: match x.modem_status.as_str() {
                         "REC UNREAD" => "unread",
                         "REC READ" => "read",
-                        "STO SENT" => "sent",
-                        "STO UNSENT" => "unsent",
+                        "STO SENT" => "submitted",
+                        "STO UNSENT" => "send-failed",
                         _ => "status-report",
                     }
                     .into(),
                     message_reference: x.message_reference,
-                    created_at_ms: stamp,
+                    created_at_ms,
                     kind: x.kind,
                     source: "sim".into(),
                     storage: "SM".into(),
@@ -621,9 +676,61 @@ mod windows_host {
                     ..Default::default()
                 }
             })
-            .collect::<Vec<_>>();
-        store.sync_sms(&records, stamp).map_err(|e| e.to_string())?;
-        Ok(records.len())
+            .collect()
+    }
+
+    fn modem_timestamp_ms(value: &str) -> Option<i64> {
+        let bytes = value.as_bytes();
+        if bytes.len() != 20
+            || bytes[2] != b'/'
+            || bytes[5] != b'/'
+            || bytes[8] != b','
+            || bytes[11] != b':'
+            || bytes[14] != b':'
+            || !matches!(bytes[17], b'+' | b'-')
+        {
+            return None;
+        }
+        let number = |start: usize| -> Option<i64> {
+            std::str::from_utf8(&bytes[start..start + 2])
+                .ok()?
+                .parse()
+                .ok()
+        };
+        let (year, month, day) = (2000 + number(0)?, number(3)?, number(6)?);
+        let (hour, minute, second) = (number(9)?, number(12)?, number(15)?);
+        let quarters = number(18)?;
+        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+        let max_day = match month {
+            2 => {
+                if leap {
+                    29
+                } else {
+                    28
+                }
+            }
+            4 | 6 | 9 | 11 => 30,
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            _ => return None,
+        };
+        if !(1..=12).contains(&month)
+            || !(1..=max_day).contains(&day)
+            || hour > 23
+            || minute > 59
+            || second > 59
+            || quarters > 79
+        {
+            return None;
+        }
+        let adjusted_year = year - i64::from(month <= 2);
+        let era = adjusted_year.div_euclid(400);
+        let yoe = adjusted_year - era * 400;
+        let shifted_month = month + if month > 2 { -3 } else { 9 };
+        let doy = (153 * shifted_month + 2) / 5 + day - 1;
+        let days = era * 146097 + (yoe * 365 + yoe / 4 - yoe / 100) + doy - 719468;
+        let local_seconds = days * 86400 + hour * 3600 + minute * 60 + second;
+        let offset = quarters * 15 * 60 * if bytes[17] == b'-' { -1 } else { 1 };
+        Some((local_seconds - offset) * 1000)
     }
     async fn actor_pdu_snapshot(
         tx: &mpsc::Sender<hardware::AtRequest>,
@@ -653,33 +760,13 @@ mod windows_host {
         tx: &mpsc::Sender<hardware::AtRequest>,
         store: &Store,
     ) -> Result<BalanceRecord, String> {
-        let raw = check_viettel_balance(tx).await;
-        if raw.starts_with("ERROR:") {
-            return Err(raw.trim().into());
-        }
-        let raw = raw.trim_end().to_owned();
+        let (raw, sms_id) = check_viettel_balance(tx, store).await?;
         let stamp = now();
-        let sms = SmsRecord {
-            id: ulid::Ulid::new().to_string(),
-            direction: "inbound".into(),
-            peer: "191".into(),
-            body: raw.clone(),
-            state: "received".into(),
-            created_at_ms: stamp,
-            kind: "received".into(),
-            source: "balance".into(),
-            part_count: 1,
-            parts_received: 1,
-            multipart_complete: true,
-            length: raw.chars().count() as i32,
-            ..Default::default()
-        };
-        store.save_sms(&sms).map_err(|e| e.to_string())?;
         let b = BalanceRecord {
             id: ulid::Ulid::new().to_string(),
             raw,
             created_at_ms: stamp,
-            sms_id: sms.id,
+            sms_id,
             ..Default::default()
         };
         store.save_balance(&b).map_err(|e| e.to_string())?;
@@ -738,34 +825,77 @@ mod windows_host {
         response.contains("+cme error:") && response.contains("operation not allowed")
     }
 
-    async fn check_viettel_balance(command_tx: &mpsc::Sender<hardware::AtRequest>) -> String {
-        let submitted = run_actor(
-            command_tx,
-            "AT+CMGS=\"191\"".into(),
-            Some(b"TK".to_vec()),
-            false,
-        )
-        .await;
-        if submitted.starts_with("ERROR:") {
-            return submitted;
+    async fn check_viettel_balance(
+        command_tx: &mpsc::Sender<hardware::AtRequest>,
+        store: &Store,
+    ) -> Result<(String, String), String> {
+        use std::collections::HashSet;
+        let baseline = actor_pdu_snapshot(command_tx).await?;
+        let baseline_records = snapshot_records(modemd::sms::parse_cmgl(&baseline), now());
+        let identities: HashSet<String> = baseline_records
+            .iter()
+            .map(|record| record.fingerprint.clone())
+            .collect();
+
+        let submitted =
+            actor_lines(command_tx, "AT+CMGS=\"191\"".into(), Some(b"TK".to_vec())).await?;
+        if !submitted.iter().any(|line| line.starts_with("+CMGS:")) {
+            return Err("modem returned OK without accepting the TK submission".into());
         }
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         while tokio::time::Instant::now() < deadline {
             match actor_pdu_snapshot(command_tx).await {
                 Ok(lines) => {
-                    if let Some(message) = modemd::sms::parse_cmgl(&lines)
-                        .into_iter()
-                        .find(|x| x.peer == "191")
-                    {
-                        return format!("{}\n", message.body);
+                    let stamp = now();
+                    let records = snapshot_records(modemd::sms::parse_cmgl(&lines), stamp);
+                    if let Some(message) = records.iter().find(|record| {
+                        !identities.contains(&record.fingerprint)
+                            && record.peer == "191"
+                            && record.multipart_complete
+                            && is_viettel_balance_body(&record.body)
+                    }) {
+                        store
+                            .sync_sms(&records, stamp)
+                            .map_err(|error| error.to_string())?;
+                        let canonical = store
+                            .list_sms(1000)
+                            .map_err(|error| error.to_string())?
+                            .into_iter()
+                            .find(|record| {
+                                record.source == "sim" && record.fingerprint == message.fingerprint
+                            })
+                            .ok_or_else(|| {
+                                "balance SMS was synchronized but could not be linked".to_owned()
+                            })?;
+                        return Ok((message.body.clone(), canonical.id));
                     }
                 }
-                Err(error) => return format!("ERROR: {error}\n"),
+                Err(error) => return Err(error),
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
-        "ERROR: timed out waiting for the balance SMS from 191\n".into()
+        Err("timed out waiting for a new complete Viettel balance SMS from 191".into())
+    }
+
+    fn is_viettel_balance_body(body: &str) -> bool {
+        let folded = body
+            .to_lowercase()
+            .replace(
+                [
+                    'á', 'à', 'ả', 'ã', 'ạ', 'ă', 'ắ', 'ằ', 'ẳ', 'ẵ', 'ặ', 'â', 'ấ', 'ầ', 'ẩ', 'ẫ',
+                    'ậ',
+                ],
+                "a",
+            )
+            .replace(
+                ['ố', 'ồ', 'ổ', 'ỗ', 'ộ', 'ô', 'ớ', 'ờ', 'ở', 'ỡ', 'ợ', 'ơ'],
+                "o",
+            )
+            .replace(['ố'], "o")
+            .replace(['ư', 'ứ', 'ừ', 'ử', 'ữ', 'ự'], "u")
+            .replace('đ', "d");
+        folded.contains("tk goc") || folded.contains("tai khoan") || folded.contains("so du")
     }
 
     #[cfg(test)]
@@ -886,7 +1016,28 @@ mod windows_host {
 
     #[cfg(test)]
     mod tests {
-        use super::{is_transient_call_release_error, viettel_balance_message};
+        use super::{
+            is_transient_call_release_error, is_viettel_balance_body, modem_timestamp_ms,
+            viettel_balance_message,
+        };
+
+        #[test]
+        fn modem_timestamp_uses_service_centre_timezone() {
+            assert_eq!(
+                modem_timestamp_ms("26/08/03,10:00:00+28"),
+                Some(1_785_726_000_000)
+            );
+            assert!(modem_timestamp_ms("invalid").is_none());
+        }
+
+        #[test]
+        fn balance_indicators_exclude_unrelated_191_notifications() {
+            assert!(is_viettel_balance_body("TK gốc: 85.500đ"));
+            assert!(is_viettel_balance_body("Số dư tài khoản của quý khách"));
+            assert!(!is_viettel_balance_body(
+                "Quý khách đã đăng ký VoLTE thành công"
+            ));
+        }
 
         #[test]
         fn retries_dial_when_previous_call_is_still_releasing() {
