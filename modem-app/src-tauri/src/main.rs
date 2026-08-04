@@ -82,6 +82,21 @@ fn logged_response(request: &str, response: &str) -> String {
         .join(" | ")
 }
 
+fn suppress_successful_poll_log(request: &str) -> bool {
+    if request == "STATUS" {
+        return true;
+    }
+    serde_json::from_str::<serde_json::Value>(request)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("command")
+                .and_then(|command| command.as_str())
+                .map(|command| matches!(command, "list_calls" | "get_current_audio"))
+        })
+        .unwrap_or(false)
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Status {
@@ -269,7 +284,10 @@ async fn request_line(request: &str) -> Result<String, String> {
     use tokio::net::windows::named_pipe::ClientOptions;
     let display_request = logged_request(request);
     let started = Instant::now();
-    log_event("APP -> MODEM", &display_request);
+    let suppress_success = suppress_successful_poll_log(request);
+    if !suppress_success {
+        log_event("APP -> SERVICE", &display_request);
+    }
     let result = async {
         let mut client = ClientOptions::new()
             .open(r"\\.\pipe\a7670-modemd-v1")
@@ -287,8 +305,8 @@ async fn request_line(request: &str) -> Result<String, String> {
     }
     .await;
     match &result {
-        Ok(response) => log_event(
-            "MODEM -> APP",
+        Ok(response) if !suppress_success => log_event(
+            "SERVICE -> APP",
             format!(
                 "{} => {} ({} ms)",
                 display_request,
@@ -296,6 +314,7 @@ async fn request_line(request: &str) -> Result<String, String> {
                 started.elapsed().as_millis()
             ),
         ),
+        Ok(_) => {}
         Err(error) => log_event(
             "MODEM ERROR",
             format!(
@@ -316,7 +335,7 @@ async fn get_status() -> Result<Status, String> {
     if fields.len() != 7 || fields[0] != "STATUS" {
         return Err("The modem service returned an invalid status response.".into());
     }
-    Ok(Status {
+    let status = Status {
         service_version: fields[1].into(),
         state: fields[2].into(),
         port: fields[3].into(),
@@ -324,7 +343,24 @@ async fn get_status() -> Result<Status, String> {
         registration: fields[5].into(),
         signal_rssi: fields[6].parse().map_err(|_| "Invalid signal value")?,
         last_error: String::new(),
-    })
+    };
+    log_status_change(&status);
+    Ok(status)
+}
+
+#[cfg(windows)]
+fn log_status_change(status: &Status) {
+    static LAST_STATUS: Mutex<Option<String>> = Mutex::new(None);
+    let summary = format!(
+        "state={} port={} sim={} registration={} signal_rssi={}",
+        status.state, status.port, status.sim_state, status.registration, status.signal_rssi
+    );
+    if let Ok(mut previous) = LAST_STATUS.lock()
+        && previous.as_ref() != Some(&summary)
+    {
+        log_event("MODEM STATE", &summary);
+        *previous = Some(summary);
+    }
 }
 
 #[cfg(not(windows))]
@@ -608,6 +644,18 @@ mod tests {
             ),
             "JSON response received (SMS and balance content redacted)"
         );
+    }
+
+    #[test]
+    fn successful_high_frequency_polls_are_suppressed() {
+        assert!(suppress_successful_poll_log("STATUS"));
+        assert!(suppress_successful_poll_log(r#"{"command":"list_calls"}"#));
+        assert!(suppress_successful_poll_log(
+            r#"{"command":"get_current_audio"}"#
+        ));
+        assert!(!suppress_successful_poll_log(
+            r#"{"command":"upload_audio"}"#
+        ));
     }
 }
 

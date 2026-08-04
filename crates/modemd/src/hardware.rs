@@ -1,5 +1,5 @@
 use crate::{
-    ModemError,
+    ModemError, RawUploadTimeoutPhase,
     at::{Dispatcher, Frame, Framer},
     settings::Settings,
 };
@@ -18,6 +18,9 @@ use std::{
 const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const SMS_SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
+const RAW_PROMPT_TIMEOUT: Duration = Duration::from_secs(2);
+const RAW_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
+const INTERACTIVE_RESYNC_WINDOW: Duration = Duration::from_millis(300);
 const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const INITIALIZATION_COMMANDS: &[&str] = &["AT+CMEE=2", "AT+CVHU=0", "AT+CMGF=1"];
 const OPTIONAL_INITIALIZATION_COMMANDS: &[&str] = &[
@@ -227,6 +230,16 @@ fn execute_command(
     if command.starts_with("ATD") {
         dispatcher.clear_urcs();
     }
+    if let (Some(payload), PayloadMode::Raw { pacing }) = (payload, payload_mode) {
+        return execute_raw_upload(
+            port,
+            command,
+            payload,
+            pacing,
+            RawUploadDeadlines::default(),
+            dispatcher,
+        );
+    }
     port.write_all(command.as_bytes())
         .map_err(|_| ModemError::Disconnected)?;
     port.write_all(b"\r")
@@ -271,10 +284,8 @@ fn execute_command(
                                 port.write_all(&[0x1a])
                                     .map_err(|_| ModemError::Disconnected)?;
                             }
-                            PayloadMode::Raw { pacing } => {
-                                transfer_raw_payload(payload, pacing, |chunk| {
-                                    port.write_all(chunk).map_err(|_| ModemError::Disconnected)
-                                })?;
+                            PayloadMode::Raw { .. } => {
+                                unreachable!("raw uploads use phased transfer")
                             }
                         }
                         port.flush().map_err(|_| ModemError::Disconnected)?;
@@ -286,6 +297,209 @@ fn execute_command(
         }
     }
     Err(ModemError::Timeout)
+}
+
+#[derive(Clone, Copy)]
+struct RawUploadDeadlines {
+    prompt: Duration,
+    final_result: Duration,
+    resync: Duration,
+}
+
+impl Default for RawUploadDeadlines {
+    fn default() -> Self {
+        Self {
+            prompt: RAW_PROMPT_TIMEOUT,
+            final_result: RAW_RESULT_TIMEOUT,
+            resync: INTERACTIVE_RESYNC_WINDOW,
+        }
+    }
+}
+
+fn execute_raw_upload(
+    port: &mut dyn SerialPort,
+    command: &str,
+    payload: &[u8],
+    pacing: Duration,
+    deadlines: RawUploadDeadlines,
+    dispatcher: &mut Dispatcher,
+) -> Result<Vec<String>, ModemError> {
+    let started = Instant::now();
+    port.write_all(command.as_bytes())
+        .map_err(|_| ModemError::Disconnected)?;
+    port.write_all(b"\r")
+        .map_err(|_| ModemError::Disconnected)?;
+    port.flush().map_err(|_| ModemError::Disconnected)?;
+    eprintln!(
+        "upload_phase=command status=sent declared_bytes={} elapsed_ms={}",
+        payload.len(),
+        started.elapsed().as_millis()
+    );
+
+    let mut lines = Vec::new();
+    let prompt_deadline = Instant::now() + deadlines.prompt;
+    let mut buffer = [0_u8; 256];
+    loop {
+        if Instant::now() >= prompt_deadline {
+            let resynchronized = resynchronize_interactive(port, dispatcher, deadlines.resync);
+            eprintln!(
+                "upload_phase=prompt status=timeout elapsed_ms={} resynchronized={resynchronized}",
+                started.elapsed().as_millis()
+            );
+            return Err(raw_upload_timeout(
+                RawUploadTimeoutPhase::Prompt,
+                0,
+                0,
+                pacing,
+                started.elapsed(),
+                resynchronized,
+            ));
+        }
+        match port.read(&mut buffer) {
+            Ok(0) => {}
+            Ok(count) => {
+                let (frames, _) = dispatcher.push(&buffer[..count], Some(command));
+                let mut prompted = false;
+                for frame in frames {
+                    match frame {
+                        Frame::Prompt => prompted = true,
+                        Frame::Line(line) if is_rejection(&line) => {
+                            eprintln!(
+                                "upload_phase=prompt status=rejected elapsed_ms={}",
+                                started.elapsed().as_millis()
+                            );
+                            return Err(ModemError::CommandRejected(line));
+                        }
+                        Frame::Line(line) if line != "OK" => lines.push(line),
+                        Frame::Line(_) => {}
+                    }
+                }
+                if prompted {
+                    eprintln!(
+                        "upload_phase=prompt status=received elapsed_ms={}",
+                        started.elapsed().as_millis()
+                    );
+                    break;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => {}
+            Err(_) => return Err(ModemError::Disconnected),
+        }
+    }
+
+    let chunks = payload.len().div_ceil(crate::audio::TRANSFER_CHUNK_BYTES);
+    transfer_raw_payload(payload, pacing, |chunk| {
+        port.write_all(chunk).map_err(|_| ModemError::Disconnected)
+    })?;
+    port.flush().map_err(|_| ModemError::Disconnected)?;
+    eprintln!(
+        "upload_phase=payload status=sent bytes={} chunks={} chunk_bytes={} pacing_ms={} elapsed_ms={}",
+        payload.len(),
+        chunks,
+        crate::audio::TRANSFER_CHUNK_BYTES,
+        pacing.as_millis(),
+        started.elapsed().as_millis()
+    );
+
+    let result_deadline = Instant::now() + deadlines.final_result;
+    loop {
+        if Instant::now() >= result_deadline {
+            let resynchronized = resynchronize_interactive(port, dispatcher, deadlines.resync);
+            eprintln!(
+                "upload_phase=result status=timeout bytes={} chunks={} pacing_ms={} elapsed_ms={} resynchronized={resynchronized}",
+                payload.len(),
+                chunks,
+                pacing.as_millis(),
+                started.elapsed().as_millis()
+            );
+            return Err(raw_upload_timeout(
+                RawUploadTimeoutPhase::FinalResult,
+                payload.len(),
+                chunks,
+                pacing,
+                started.elapsed(),
+                resynchronized,
+            ));
+        }
+        match port.read(&mut buffer) {
+            Ok(0) => {}
+            Ok(count) => {
+                let (frames, _) = dispatcher.push(&buffer[..count], Some(command));
+                for frame in frames {
+                    if let Frame::Line(line) = frame {
+                        if line == "OK" {
+                            eprintln!(
+                                "upload_phase=result status=ok bytes={} chunks={} pacing_ms={} elapsed_ms={}",
+                                payload.len(),
+                                chunks,
+                                pacing.as_millis(),
+                                started.elapsed().as_millis()
+                            );
+                            return Ok(lines);
+                        }
+                        if is_rejection(&line) {
+                            eprintln!(
+                                "upload_phase=result status=rejected bytes={} chunks={} pacing_ms={} elapsed_ms={}",
+                                payload.len(),
+                                chunks,
+                                pacing.as_millis(),
+                                started.elapsed().as_millis()
+                            );
+                            return Err(ModemError::CommandRejected(line));
+                        }
+                        lines.push(line);
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => {}
+            Err(_) => return Err(ModemError::Disconnected),
+        }
+    }
+}
+
+fn is_rejection(line: &str) -> bool {
+    line == "ERROR" || line.starts_with("+CME ERROR:") || line.starts_with("+CMS ERROR:")
+}
+
+fn raw_upload_timeout(
+    phase: RawUploadTimeoutPhase,
+    bytes_sent: usize,
+    chunks_sent: usize,
+    pacing: Duration,
+    elapsed: Duration,
+    resynchronized: bool,
+) -> ModemError {
+    ModemError::RawUploadTimeout {
+        phase,
+        bytes_sent,
+        chunks_sent,
+        pacing_ms: pacing.as_millis().try_into().unwrap_or(u64::MAX),
+        elapsed_ms: elapsed.as_millis().try_into().unwrap_or(u64::MAX),
+        resynchronized,
+    }
+}
+
+fn resynchronize_interactive(
+    port: &mut dyn SerialPort,
+    dispatcher: &mut Dispatcher,
+    window: Duration,
+) -> bool {
+    dispatcher.reset();
+    if port.clear(serialport::ClearBuffer::Input).is_err() {
+        return false;
+    }
+    let deadline = Instant::now() + window;
+    let mut buffer = [0_u8; 256];
+    while Instant::now() < deadline {
+        match port.read(&mut buffer) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => thread::yield_now(),
+            Err(_) => return false,
+        }
+    }
+    let cleared = port.clear(serialport::ClearBuffer::Input).is_ok();
+    dispatcher.reset();
+    cleared
 }
 
 fn payload_timeout(payload: Option<&[u8]>, mode: PayloadMode) -> Duration {
@@ -532,6 +746,165 @@ fn is_dedicated_at_port(candidate: &PortCandidate) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serialport::{ClearBuffer, DataBits, FlowControl, Parity, StopBits};
+    use std::{
+        collections::VecDeque,
+        io::{Read, Write},
+        sync::atomic::AtomicUsize,
+    };
+
+    enum ReadStep {
+        Bytes(Vec<u8>),
+        Timeout,
+    }
+
+    struct ScriptedPort {
+        reads: VecDeque<ReadStep>,
+        writes: Vec<Vec<u8>>,
+        timeout: Duration,
+        clears: AtomicUsize,
+    }
+
+    impl ScriptedPort {
+        fn new(reads: impl IntoIterator<Item = ReadStep>) -> Self {
+            Self {
+                reads: reads.into_iter().collect(),
+                writes: Vec::new(),
+                timeout: Duration::from_millis(1),
+                clears: AtomicUsize::new(0),
+            }
+        }
+
+        fn serial_error() -> serialport::Error {
+            serialport::Error::new(serialport::ErrorKind::Unknown, "unsupported in test")
+        }
+    }
+
+    impl Read for ScriptedPort {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            match self.reads.pop_front().unwrap_or(ReadStep::Timeout) {
+                ReadStep::Bytes(bytes) => {
+                    assert!(bytes.len() <= buffer.len());
+                    buffer[..bytes.len()].copy_from_slice(&bytes);
+                    Ok(bytes.len())
+                }
+                ReadStep::Timeout => {
+                    thread::sleep(self.timeout);
+                    Err(io::ErrorKind::TimedOut.into())
+                }
+            }
+        }
+    }
+
+    impl Write for ScriptedPort {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.writes.push(buffer.to_vec());
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SerialPort for ScriptedPort {
+        fn name(&self) -> Option<String> {
+            Some("scripted".into())
+        }
+        fn baud_rate(&self) -> serialport::Result<u32> {
+            Ok(115_200)
+        }
+        fn data_bits(&self) -> serialport::Result<DataBits> {
+            Ok(DataBits::Eight)
+        }
+        fn flow_control(&self) -> serialport::Result<FlowControl> {
+            Ok(FlowControl::None)
+        }
+        fn parity(&self) -> serialport::Result<Parity> {
+            Ok(Parity::None)
+        }
+        fn stop_bits(&self) -> serialport::Result<StopBits> {
+            Ok(StopBits::One)
+        }
+        fn timeout(&self) -> Duration {
+            self.timeout
+        }
+        fn set_baud_rate(&mut self, _baud_rate: u32) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn set_data_bits(&mut self, _data_bits: DataBits) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn set_flow_control(&mut self, _flow_control: FlowControl) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn set_parity(&mut self, _parity: Parity) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn set_stop_bits(&mut self, _stop_bits: StopBits) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn set_timeout(&mut self, timeout: Duration) -> serialport::Result<()> {
+            self.timeout = timeout;
+            Ok(())
+        }
+        fn write_request_to_send(&mut self, _level: bool) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn write_data_terminal_ready(&mut self, _level: bool) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn read_clear_to_send(&mut self) -> serialport::Result<bool> {
+            Ok(true)
+        }
+        fn read_data_set_ready(&mut self) -> serialport::Result<bool> {
+            Ok(true)
+        }
+        fn read_ring_indicator(&mut self) -> serialport::Result<bool> {
+            Ok(false)
+        }
+        fn read_carrier_detect(&mut self) -> serialport::Result<bool> {
+            Ok(true)
+        }
+        fn bytes_to_read(&self) -> serialport::Result<u32> {
+            Ok(0)
+        }
+        fn bytes_to_write(&self) -> serialport::Result<u32> {
+            Ok(0)
+        }
+        fn clear(&self, _buffer_to_clear: ClearBuffer) -> serialport::Result<()> {
+            self.clears.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        fn try_clone(&self) -> serialport::Result<Box<dyn SerialPort>> {
+            Err(Self::serial_error())
+        }
+        fn set_break(&self) -> serialport::Result<()> {
+            Ok(())
+        }
+        fn clear_break(&self) -> serialport::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn test_deadlines() -> RawUploadDeadlines {
+        RawUploadDeadlines {
+            prompt: Duration::from_millis(8),
+            final_result: Duration::from_millis(8),
+            resync: Duration::ZERO,
+        }
+    }
+
+    fn raw_command(port: &mut ScriptedPort, payload: &[u8]) -> Result<Vec<String>, ModemError> {
+        execute_raw_upload(
+            port,
+            "AT+CFTRANRX=\"C:/test.amr\",600",
+            payload,
+            Duration::ZERO,
+            test_deadlines(),
+            &mut Dispatcher::default(),
+        )
+    }
 
     #[test]
     fn com_ports_are_sorted_numerically() {
@@ -647,5 +1020,104 @@ mod tests {
         );
         assert_eq!(writes.concat(), payload);
         assert_ne!(writes.last().and_then(|chunk| chunk.last()), Some(&0x1a));
+    }
+
+    #[test]
+    fn raw_upload_accepts_prompt_split_across_reads_and_final_ok() {
+        let payload = vec![0x55; 600];
+        let mut port = ScriptedPort::new([
+            ReadStep::Bytes(b"\r\n".to_vec()),
+            ReadStep::Bytes(b">".to_vec()),
+            ReadStep::Bytes(b" \r\nO".to_vec()),
+            ReadStep::Bytes(b"K\r\n".to_vec()),
+        ]);
+        raw_command(&mut port, &payload).unwrap();
+        assert_eq!(port.writes[0], b"AT+CFTRANRX=\"C:/test.amr\",600");
+        assert_eq!(port.writes[1], b"\r");
+        assert_eq!(
+            port.writes[2..].iter().map(Vec::len).collect::<Vec<_>>(),
+            [256, 256, 88]
+        );
+        assert_eq!(port.writes[2..].concat(), payload);
+        assert!(!port.writes[2..].iter().any(|write| write == &[0x1a]));
+    }
+
+    #[test]
+    fn raw_upload_reports_immediate_error_without_sending_payload() {
+        let payload = vec![0x55; 600];
+        let mut port = ScriptedPort::new([ReadStep::Bytes(b"\r\nERROR\r\n".to_vec())]);
+        assert_eq!(
+            raw_command(&mut port, &payload),
+            Err(ModemError::CommandRejected("ERROR".into()))
+        );
+        assert_eq!(port.writes.len(), 2);
+    }
+
+    #[test]
+    fn raw_upload_distinguishes_missing_prompt_from_missing_final_ok() {
+        let payload = vec![0x55; 600];
+        let mut missing_prompt = ScriptedPort::new([ReadStep::Timeout]);
+        assert!(matches!(
+            raw_command(&mut missing_prompt, &payload),
+            Err(ModemError::RawUploadTimeout {
+                phase: RawUploadTimeoutPhase::Prompt,
+                bytes_sent: 0,
+                resynchronized: true,
+                ..
+            })
+        ));
+        assert_eq!(missing_prompt.writes.len(), 2);
+
+        let mut missing_result =
+            ScriptedPort::new([ReadStep::Bytes(b"\r\n> ".to_vec()), ReadStep::Timeout]);
+        assert!(matches!(
+            raw_command(&mut missing_result, &payload),
+            Err(ModemError::RawUploadTimeout {
+                phase: RawUploadTimeoutPhase::FinalResult,
+                bytes_sent: 600,
+                chunks_sent: 3,
+                resynchronized: true,
+                ..
+            })
+        ));
+        assert_eq!(missing_result.writes[2..].concat(), payload);
+    }
+
+    #[test]
+    fn timed_out_interactive_transfer_resets_framing_before_next_command() {
+        let payload = vec![0x55; 10];
+        let mut port = ScriptedPort::new([
+            ReadStep::Bytes(b"\r\n> ".to_vec()),
+            ReadStep::Bytes(b"\r\nSTALE".to_vec()),
+            ReadStep::Timeout,
+        ]);
+        let mut dispatcher = Dispatcher::default();
+        assert!(matches!(
+            execute_raw_upload(
+                &mut port,
+                "AT+CFTRANRX=\"C:/test.amr\",10",
+                &payload,
+                Duration::ZERO,
+                test_deadlines(),
+                &mut dispatcher,
+            ),
+            Err(ModemError::RawUploadTimeout { .. })
+        ));
+        assert!(port.clears.load(Ordering::Relaxed) >= 2);
+        port.reads
+            .push_back(ReadStep::Bytes(b"\r\nOK\r\n".to_vec()));
+        assert!(
+            execute_command(
+                &mut port,
+                "AT",
+                None,
+                false,
+                Duration::from_millis(8),
+                PayloadMode::Sms,
+                &mut dispatcher,
+            )
+            .unwrap()
+            .is_empty()
+        );
     }
 }

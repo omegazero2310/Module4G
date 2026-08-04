@@ -105,18 +105,62 @@ impl CallManager {
             .clone();
         let info = inspect_amr(&data, settings.max_audio_bytes)?;
         let size = data.len() as u64;
-        let id = ulid::Ulid::new().to_string();
-        let target_path = module_path(&id)?;
+        eprintln!(
+            "upload_validation status=ok bytes={} amr_frames={} duration_ms={}",
+            size,
+            info.frames,
+            info.duration.as_millis()
+        );
+        let mut id = ulid::Ulid::new().to_string();
+        let mut target_path = module_path(&id)?;
+        let mut target_name = module_filename(&id)?;
         let previous = self.store.current_audio()?;
-        actor_lines(
+        let configured_pacing = Duration::from_millis(u64::from(settings.upload_pacing_ms));
+        let first_result = actor_lines(
             &self.command_tx,
             format!("AT+CFTRANRX=\"{target_path}\",{}", data.len()),
-            Some(data),
+            Some(data.clone()),
             PayloadMode::Raw {
-                pacing: Duration::from_millis(u64::from(settings.upload_pacing_ms)),
+                pacing: configured_pacing,
             },
         )
-        .await?;
+        .await;
+        if let Err(error) = first_result {
+            if !recoverable_upload_timeout(&error) {
+                return Err(upload_stage_error("transfer", error));
+            }
+
+            eprintln!(
+                "upload_retry reason=recoverable_timeout parser_resynchronized=true next_pacing_ms={} ",
+                configured_pacing.max(Duration::from_millis(50)).as_millis()
+            );
+            let _ = delete_module_file(&self.command_tx, &target_name).await;
+            id = ulid::Ulid::new().to_string();
+            target_path = module_path(&id)?;
+            target_name = module_filename(&id)?;
+            let retry_result = actor_lines(
+                &self.command_tx,
+                format!("AT+CFTRANRX=\"{target_path}\",{}", data.len()),
+                Some(data),
+                PayloadMode::Raw {
+                    pacing: configured_pacing.max(Duration::from_millis(50)),
+                },
+            )
+            .await;
+            if let Err(error) = retry_result {
+                if recoverable_upload_timeout(&error)
+                    || matches!(error, ModemError::CommandRejected(_))
+                {
+                    let _ = delete_module_file(&self.command_tx, &target_name).await;
+                }
+                return Err(upload_stage_error("retry transfer", error));
+            }
+        }
+
+        if let Err(error) = verify_uploaded_size(&self.command_tx, &target_name, size).await {
+            let _ = delete_module_file(&self.command_tx, &target_name).await;
+            return Err(error);
+        }
 
         let audio = UploadedAudioRecord {
             id,
@@ -132,13 +176,8 @@ impl CallManager {
 
         if let Some(previous) = previous.filter(|old| old.id != audio.id) {
             if module_path(&previous.id).as_deref() == Ok(previous.module_path.as_str()) {
-                let _ = actor_lines(
-                    &self.command_tx,
-                    format!("AT+FSDEL=\"{}\"", previous.module_path),
-                    None,
-                    PayloadMode::Sms,
-                )
-                .await;
+                let previous_name = module_filename(&previous.id)?;
+                let _ = delete_module_file(&self.command_tx, &previous_name).await;
             }
         }
         Ok(audio)
@@ -470,6 +509,70 @@ async fn actor_lines(
     response.await.map_err(|_| ModemError::Disconnected)?
 }
 
+async fn actor_batch_lines(
+    tx: &mpsc::Sender<AtRequest>,
+    batch: Vec<String>,
+) -> Result<Vec<String>, ModemError> {
+    let (reply, response) = tokio::sync::oneshot::channel();
+    tx.send(AtRequest {
+        command: String::new(),
+        payload: None,
+        guarded: false,
+        payload_mode: PayloadMode::Sms,
+        batch,
+        finalizer: None,
+        reply,
+    })
+    .map_err(|_| ModemError::Disconnected)?;
+    response.await.map_err(|_| ModemError::Disconnected)?
+}
+
+fn module_filename(audio_id: &str) -> Result<String, ModemError> {
+    module_path(audio_id)?
+        .rsplit_once('/')
+        .map(|(_, name)| name.to_owned())
+        .ok_or_else(|| ModemError::Validation("invalid modem audio path".into()))
+}
+
+async fn verify_uploaded_size(
+    tx: &mpsc::Sender<AtRequest>,
+    filename: &str,
+    expected: u64,
+) -> Result<(), ModemError> {
+    let lines = actor_batch_lines(
+        tx,
+        vec!["AT+FSCD=C:".into(), format!("AT+FSATTRI=\"{filename}\"")],
+    )
+    .await
+    .map_err(|error| upload_stage_error("size verification", error))?;
+    let actual = lines
+        .iter()
+        .find_map(|line| line.strip_prefix("+FSATTRI:"))
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .ok_or_else(|| {
+            ModemError::CommandRejected(
+                "audio upload size verification failed: modem did not report a file size".into(),
+            )
+        })?;
+    if actual != expected {
+        return Err(ModemError::CommandRejected(format!(
+            "audio upload size verification failed: expected {expected} byte(s), modem reported {actual}"
+        )));
+    }
+    Ok(())
+}
+
+async fn delete_module_file(
+    tx: &mpsc::Sender<AtRequest>,
+    filename: &str,
+) -> Result<Vec<String>, ModemError> {
+    actor_batch_lines(
+        tx,
+        vec!["AT+FSCD=C:".into(), format!("AT+FSDEL=\"{filename}\"")],
+    )
+    .await
+}
+
 async fn dial_with_retry(
     tx: &mpsc::Sender<AtRequest>,
     destination: &str,
@@ -552,6 +655,20 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+fn recoverable_upload_timeout(error: &ModemError) -> bool {
+    matches!(
+        error,
+        ModemError::RawUploadTimeout {
+            resynchronized: true,
+            ..
+        }
+    )
+}
+
+fn upload_stage_error(stage: &str, error: ModemError) -> ModemError {
+    ModemError::CommandRejected(format!("audio upload {stage} failed: {error}"))
 }
 
 #[cfg(test)]
@@ -749,14 +866,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_replacement_retains_previous_current_audio() {
+    async fn non_resynchronized_timeout_is_not_retried_and_retains_previous_audio() {
         let (manager, rx, store) = manager_fixture();
         let actor = thread::spawn(move || {
             let request = rx.recv().unwrap();
             assert!(request.command.starts_with("AT+CFTRANRX="));
-            let _ = request
-                .reply
-                .send(Err(ModemError::CommandRejected("upload rejected".into())));
+            let _ = request.reply.send(Err(ModemError::RawUploadTimeout {
+                phase: crate::RawUploadTimeoutPhase::Prompt,
+                bytes_sent: 0,
+                chunks_sent: 0,
+                pacing_ms: 50,
+                elapsed_ms: 2_000,
+                resynchronized: false,
+            }));
         });
         let mut amr = crate::audio::AMR_NB_MAGIC.to_vec();
         amr.push(0x04);
@@ -764,5 +886,112 @@ mod tests {
         assert!(manager.upload_audio("new.amr".into(), amr).await.is_err());
         actor.join().unwrap();
         assert_eq!(store.current_audio().unwrap().unwrap().id, "audio");
+    }
+
+    #[tokio::test]
+    async fn unreliable_fast_upload_retries_once_with_manual_recommended_pacing() {
+        let (manager, rx, store) = manager_fixture();
+        let mut settings = manager.settings();
+        settings.upload_pacing_ms = 10;
+        manager.update_settings(settings).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let actor_seen = Arc::clone(&seen);
+        let actor = thread::spawn(move || {
+            for index in 0..5 {
+                let request = rx.recv().unwrap();
+                actor_seen.lock().unwrap().push((
+                    request.command.clone(),
+                    request.payload_mode,
+                    request.batch.clone(),
+                ));
+                let result = if index == 0 {
+                    Err(ModemError::RawUploadTimeout {
+                        phase: crate::RawUploadTimeoutPhase::FinalResult,
+                        bytes_sent: 19,
+                        chunks_sent: 1,
+                        pacing_ms: 10,
+                        elapsed_ms: 100,
+                        resynchronized: true,
+                    })
+                } else if index == 3 {
+                    Ok(vec!["+FSATTRI: 19".into()])
+                } else {
+                    Ok(Vec::new())
+                };
+                let _ = request.reply.send(result);
+            }
+        });
+        let mut amr = crate::audio::AMR_NB_MAGIC.to_vec();
+        amr.push(0x04);
+        amr.extend([0_u8; 12]);
+        let uploaded = manager.upload_audio("retry.amr".into(), amr).await.unwrap();
+        actor.join().unwrap();
+        assert_eq!(store.current_audio().unwrap().unwrap().id, uploaded.id);
+        let seen = seen.lock().unwrap();
+        let transfers: Vec<_> = seen
+            .iter()
+            .filter(|(command, _, _)| command.starts_with("AT+CFTRANRX="))
+            .collect();
+        assert_eq!(transfers.len(), 2);
+        assert_ne!(transfers[0].0, transfers[1].0);
+        assert_eq!(
+            transfers[0].1,
+            PayloadMode::Raw {
+                pacing: Duration::from_millis(10)
+            }
+        );
+        assert_eq!(
+            transfers[1].1,
+            PayloadMode::Raw {
+                pacing: Duration::from_millis(50)
+            }
+        );
+        assert_eq!(seen[1].2[0], "AT+FSCD=C:");
+        assert!(seen[1].2[1].starts_with("AT+FSDEL=\"call_"));
+        assert!(!seen[1].2[1].contains("C:/"));
+        assert_eq!(seen[3].2[0], "AT+FSCD=C:");
+        assert!(seen[3].2[1].starts_with("AT+FSATTRI=\"call_"));
+        assert_eq!(
+            seen[4].2,
+            [
+                "AT+FSCD=C:".to_owned(),
+                "AT+FSDEL=\"call_audio.amr\"".to_owned()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn size_mismatch_keeps_previous_audio_and_deletes_relative_partial_file() {
+        let (manager, rx, store) = manager_fixture();
+        let seen = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let actor_seen = Arc::clone(&seen);
+        let actor = thread::spawn(move || {
+            for index in 0..3 {
+                let request = rx.recv().unwrap();
+                actor_seen.lock().unwrap().push(request.batch.clone());
+                let response = if index == 1 {
+                    Ok(vec!["+FSATTRI: 18".into()])
+                } else {
+                    Ok(Vec::new())
+                };
+                let _ = request.reply.send(response);
+            }
+        });
+        let mut amr = crate::audio::AMR_NB_MAGIC.to_vec();
+        amr.push(0x04);
+        amr.extend([0_u8; 12]);
+        let error = manager
+            .upload_audio("mismatch.amr".into(), amr)
+            .await
+            .unwrap_err();
+        actor.join().unwrap();
+        assert!(error.to_string().contains("expected 19 byte(s)"));
+        assert_eq!(store.current_audio().unwrap().unwrap().id, "audio");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[1][0], "AT+FSCD=C:");
+        assert!(seen[1][1].starts_with("AT+FSATTRI=\"call_"));
+        assert_eq!(seen[2][0], "AT+FSCD=C:");
+        assert!(seen[2][1].starts_with("AT+FSDEL=\"call_"));
+        assert!(!seen[2][1].contains("C:/"));
     }
 }

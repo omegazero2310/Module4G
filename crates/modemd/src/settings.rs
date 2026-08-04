@@ -25,7 +25,9 @@ impl Default for Settings {
             port_override: None,
             baud: 115_200,
             call_timeout_seconds: 90,
-            upload_pacing_ms: 10,
+            // SIMCom recommends 50 ms between each 256-byte block when a
+            // CFTRANRX transfer is unreliable, especially over USB.
+            upload_pacing_ms: 50,
             max_audio_bytes: 200 * 1024,
             ussd_code: "*101#".into(),
             ussd_timeout_seconds: 30,

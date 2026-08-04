@@ -42,6 +42,11 @@ impl Dispatcher {
     pub fn clear_urcs(&mut self) {
         self.pending_urcs.clear();
     }
+
+    pub fn reset(&mut self) {
+        self.framer.reset();
+        self.pending_urcs.clear();
+    }
 }
 
 impl Framer {

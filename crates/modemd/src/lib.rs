@@ -9,6 +9,21 @@ pub mod settings;
 pub mod sms;
 pub mod storage;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RawUploadTimeoutPhase {
+    Prompt,
+    FinalResult,
+}
+
+impl std::fmt::Display for RawUploadTimeoutPhase {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Prompt => "before the data prompt",
+            Self::FinalResult => "after the final payload byte",
+        })
+    }
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ModemError {
     #[error("validation failed: {0}")]
@@ -19,6 +34,17 @@ pub enum ModemError {
     Disconnected,
     #[error("command timed out")]
     Timeout,
+    #[error(
+        "raw upload timed out {phase} ({bytes_sent} byte(s), {chunks_sent} chunk(s), {pacing_ms} ms pacing, {elapsed_ms} ms elapsed; parser resynchronized: {resynchronized})"
+    )]
+    RawUploadTimeout {
+        phase: RawUploadTimeoutPhase,
+        bytes_sent: usize,
+        chunks_sent: usize,
+        pacing_ms: u64,
+        elapsed_ms: u64,
+        resynchronized: bool,
+    },
     #[error("SIM unavailable")]
     SimUnavailable,
     #[error("network unavailable")]
@@ -35,7 +61,9 @@ impl From<ModemError> for tonic::Status {
             ModemError::Validation(message) => tonic::Status::invalid_argument(message),
             ModemError::Busy => tonic::Status::resource_exhausted(error.to_string()),
             ModemError::Disconnected => tonic::Status::unavailable(error.to_string()),
-            ModemError::Timeout => tonic::Status::deadline_exceeded(error.to_string()),
+            ModemError::Timeout | ModemError::RawUploadTimeout { .. } => {
+                tonic::Status::deadline_exceeded(error.to_string())
+            }
             ModemError::SimUnavailable
             | ModemError::NetworkUnavailable
             | ModemError::CommandRejected(_) => {
