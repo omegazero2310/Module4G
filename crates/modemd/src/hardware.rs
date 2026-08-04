@@ -17,6 +17,7 @@ use std::{
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+const SMS_STORAGE_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const SMS_PROMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const SMS_SUBMIT_TIMEOUT: Duration = Duration::from_secs(40);
 const RAW_PROMPT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -152,7 +153,15 @@ pub fn monitor_with_commands(
                             &request.command,
                             request.payload.as_deref(),
                             request.guarded,
-                            payload_timeout(request.payload.as_deref(), request.payload_mode),
+                            request.payload.as_ref().map_or_else(
+                                || command_timeout(&request.command),
+                                |_| {
+                                    payload_timeout(
+                                        request.payload.as_deref(),
+                                        request.payload_mode,
+                                    )
+                                },
+                            ),
                             request.payload_mode,
                             &mut dispatcher,
                         )
@@ -163,7 +172,7 @@ pub fn monitor_with_commands(
                                 command,
                                 None,
                                 false,
-                                COMMAND_TIMEOUT,
+                                command_timeout(command),
                                 PayloadMode::Sms,
                                 &mut dispatcher,
                             )
@@ -753,6 +762,19 @@ fn payload_timeout(payload: Option<&[u8]>, mode: PayloadMode) -> Duration {
     }
 }
 
+fn command_timeout(command: &str) -> Duration {
+    if [
+        "AT+CMGF", "AT+CPMS", "AT+CSMP", "AT+CNMI", "AT+CMGL", "AT+CMGD",
+    ]
+    .iter()
+    .any(|prefix| command.to_ascii_uppercase().starts_with(prefix))
+    {
+        SMS_STORAGE_COMMAND_TIMEOUT
+    } else {
+        COMMAND_TIMEOUT
+    }
+}
+
 fn transfer_raw_payload(
     payload: &[u8],
     pacing: Duration,
@@ -1194,6 +1216,20 @@ mod tests {
                 "AT+CSDH=1"
             ]
         );
+    }
+
+    #[test]
+    fn sms_configuration_and_storage_commands_allow_the_documented_response_window() {
+        for command in [
+            "AT+CNMI=2,1,0,1,0",
+            "AT+CSMP?",
+            "AT+CPMS?",
+            "AT+CMGL=4",
+            "AT+CMGD=40",
+        ] {
+            assert_eq!(command_timeout(command), SMS_STORAGE_COMMAND_TIMEOUT);
+        }
+        assert_eq!(command_timeout("AT+CSQ"), COMMAND_TIMEOUT);
     }
 
     #[test]

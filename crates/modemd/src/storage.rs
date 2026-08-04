@@ -455,6 +455,20 @@ impl Store {
         Ok(matched != 0)
     }
 
+    pub fn mark_sms_archived(&self, records: &[SmsRecord]) -> Result<(), ModemError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction().map_err(db_error)?;
+        for record in records.iter().filter(|record| record.source == "sim") {
+            transaction
+                .execute(
+                    "UPDATE sms SET present_on_modem=0 WHERE source='sim' AND storage=?1 AND fingerprint=?2",
+                    params![record.storage, record.fingerprint],
+                )
+                .map_err(db_error)?;
+        }
+        transaction.commit().map_err(db_error)
+    }
+
     pub fn save_sms(&self, r: &SmsRecord) -> Result<(), ModemError> {
         self.connection()?.execute("INSERT INTO sms(id,direction,peer,body,state,message_reference,cause,created_at_ms,kind,source,storage,storage_index,modem_status,modem_timestamp,encoding,dcs,length,service_center,delivery_status,synchronized_at_ms,present_on_modem,fingerprint,storage_indices,part_count,parts_received,multipart_complete,delivery_report_requested,delivery_report_scts,delivery_report_discharge_time,delivery_tracking_error) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30) ON CONFLICT(id) DO UPDATE SET state=excluded.state,message_reference=excluded.message_reference,cause=excluded.cause,delivery_status=excluded.delivery_status,synchronized_at_ms=excluded.synchronized_at_ms,present_on_modem=excluded.present_on_modem,delivery_report_requested=excluded.delivery_report_requested,delivery_report_scts=excluded.delivery_report_scts,delivery_report_discharge_time=excluded.delivery_report_discharge_time,delivery_tracking_error=excluded.delivery_tracking_error",params![r.id,r.direction,r.peer,r.body,r.state,r.message_reference,r.cause,r.created_at_ms,r.kind,r.source,r.storage,r.storage_index,r.modem_status,r.modem_timestamp,r.encoding,r.dcs,r.length,r.service_center,r.delivery_status,r.synchronized_at_ms,r.present_on_modem,r.fingerprint,serde_json::to_string(&r.storage_indices).map_err(db_error)?,r.part_count,r.parts_received,r.multipart_complete,r.delivery_report_requested,r.delivery_report_scts,r.delivery_report_discharge_time,r.delivery_tracking_error]).map_err(db_error)?;
         Ok(())
@@ -1137,6 +1151,32 @@ mod tests {
             .unwrap();
         assert_eq!(sent.state, "delivered");
         assert_eq!(sent.delivery_status, "0x00");
+    }
+
+    #[test]
+    fn archived_modem_sms_remains_in_history_but_is_no_longer_marked_present() {
+        let store = Store::memory().unwrap();
+        let record = SmsRecord {
+            id: "received".into(),
+            direction: "inbound".into(),
+            peer: "+66812345678".into(),
+            body: "hello".into(),
+            state: "read".into(),
+            kind: "received".into(),
+            source: "sim".into(),
+            storage: "SM".into(),
+            storage_index: 4,
+            storage_indices: vec![4],
+            fingerprint: "received-fingerprint".into(),
+            present_on_modem: true,
+            ..Default::default()
+        };
+        store.sync_sms(std::slice::from_ref(&record), 10).unwrap();
+        store.mark_sms_archived(&[record]).unwrap();
+
+        let archived = store.list_sms(1).unwrap().pop().unwrap();
+        assert_eq!(archived.body, "hello");
+        assert!(!archived.present_on_modem);
     }
 
     #[test]

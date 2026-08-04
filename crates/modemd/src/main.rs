@@ -154,6 +154,7 @@ mod windows_host {
         ));
         let device_state = Arc::new(RwLock::new(hardware::HardwareState::Disconnected));
         let delivery_capability = Arc::new(RwLock::new(DeliveryCapability::default()));
+        let delivery_configuration = Arc::new(tokio::sync::Mutex::new(()));
         let monitor_state = Arc::clone(&device_state);
         let monitor_capability = Arc::clone(&delivery_capability);
         let monitor_stop = Arc::new(AtomicBool::new(false));
@@ -198,6 +199,7 @@ mod windows_host {
         let sync_store = Arc::clone(&store);
         let sync_calls = Arc::clone(&call_manager);
         let sync_capability = Arc::clone(&delivery_capability);
+        let sync_configuration = Arc::clone(&delivery_configuration);
         let sync_device_state = Arc::clone(&device_state);
         let sms_synchronizer = tokio::spawn(async move {
             let mut next_reconciliation = tokio::time::Instant::now();
@@ -220,10 +222,19 @@ mod windows_host {
                         || (!capability.available && current >= next_configuration_attempt)
                 };
                 if modem_ready && sync_calls.sms_sync_allowed() && needs_configuration {
-                    let capability = configure_delivery_tracking(&sync_tx).await;
-                    *sync_capability
-                        .write()
-                        .unwrap_or_else(|lock| lock.into_inner()) = capability;
+                    let _configuration = sync_configuration.lock().await;
+                    let still_needs_configuration = {
+                        let capability = sync_capability
+                            .read()
+                            .unwrap_or_else(|lock| lock.into_inner());
+                        !capability.attempted || !capability.available
+                    };
+                    if still_needs_configuration {
+                        let capability = configure_delivery_tracking(&sync_tx).await;
+                        *sync_capability
+                            .write()
+                            .unwrap_or_else(|lock| lock.into_inner()) = capability;
+                    }
                     next_configuration_attempt =
                         tokio::time::Instant::now() + Duration::from_secs(10);
                 }
@@ -290,7 +301,7 @@ mod windows_host {
                 },
                 connected = server.connect() => {
                     connected?;
-                    tokio::spawn(handle_client(server, Arc::clone(&device_state), Arc::clone(&delivery_capability), command_tx.clone(), Arc::clone(&store), Arc::clone(&call_manager)));
+                    tokio::spawn(handle_client(server, Arc::clone(&device_state), Arc::clone(&delivery_capability), Arc::clone(&delivery_configuration), command_tx.clone(), Arc::clone(&store), Arc::clone(&call_manager)));
                 }
             }
         }
@@ -344,6 +355,7 @@ mod windows_host {
         server: tokio::net::windows::named_pipe::NamedPipeServer,
         device_state: Arc<RwLock<hardware::HardwareState>>,
         delivery_capability: Arc<RwLock<DeliveryCapability>>,
+        delivery_configuration: Arc<tokio::sync::Mutex<()>>,
         command_tx: mpsc::Sender<hardware::AtRequest>,
         store: Arc<Store>,
         call_manager: Arc<CallManager>,
@@ -359,6 +371,7 @@ mod windows_host {
                     &store,
                     &call_manager,
                     &delivery_capability,
+                    &delivery_configuration,
                 )
                 .await
             } else if request == "STATUS" {
@@ -461,6 +474,7 @@ mod windows_host {
         store: &Store,
         call_manager: &Arc<CallManager>,
         delivery_capability: &Arc<RwLock<DeliveryCapability>>,
+        delivery_configuration: &Arc<tokio::sync::Mutex<()>>,
     ) -> String {
         let value: serde_json::Value = match serde_json::from_str(request) {
             Ok(v) => v,
@@ -495,9 +509,15 @@ mod windows_host {
                 .list_balances(1000)
                 .map(|x| serde_json::to_value(x).unwrap())
                 .map_err(|e| e.to_string()),
-            "send_sms" => send_sms_json(value, tx, store, delivery_capability)
-                .await
-                .map(|x| serde_json::to_value(x).unwrap()),
+            "send_sms" => send_sms_json(
+                value,
+                tx,
+                store,
+                delivery_capability,
+                delivery_configuration,
+            )
+            .await
+            .map(|x| serde_json::to_value(x).unwrap()),
             "sync_sms" => sync_sms_json(tx, store)
                 .await
                 .map(|x| serde_json::json!({"count":x})),
@@ -623,6 +643,7 @@ mod windows_host {
         tx: &mpsc::Sender<hardware::AtRequest>,
         store: &Store,
         delivery_capability: &Arc<RwLock<DeliveryCapability>>,
+        delivery_configuration: &Arc<tokio::sync::Mutex<()>>,
     ) -> Result<SmsRecord, String> {
         let peer = modemd::sms::normalize_number(
             v.get("destination")
@@ -653,15 +674,22 @@ mod windows_host {
             storage_index: -1,
             ..Default::default()
         };
-        let needs_configuration = !delivery_capability
+        if !delivery_capability
             .read()
             .unwrap_or_else(|lock| lock.into_inner())
-            .attempted;
-        if needs_configuration {
-            let capability = configure_delivery_tracking(tx).await;
-            *delivery_capability
-                .write()
-                .unwrap_or_else(|lock| lock.into_inner()) = capability;
+            .attempted
+        {
+            let _configuration = delivery_configuration.lock().await;
+            let still_needs_configuration = !delivery_capability
+                .read()
+                .unwrap_or_else(|lock| lock.into_inner())
+                .attempted;
+            if still_needs_configuration {
+                let capability = configure_delivery_tracking(tx).await;
+                *delivery_capability
+                    .write()
+                    .unwrap_or_else(|lock| lock.into_inner()) = capability;
+            }
         }
         let capability = delivery_capability
             .read()
@@ -755,7 +783,7 @@ mod windows_host {
                 general_errors.push(format!("{label} configuration failed"));
             }
         }
-        let report_request_available = configure_and_verify(
+        let report_request = configure_and_verify(
             tx,
             "CSMP",
             "AT+CSMP=49,167,0,0",
@@ -763,7 +791,8 @@ mod windows_host {
             "+CSMP:49,167,0,0",
         )
         .await;
-        let direct_report_reception = configure_and_verify(
+        let report_request_available = report_request.is_ok();
+        let direct_report = configure_and_verify(
             tx,
             "CNMI",
             "AT+CNMI=2,1,0,1,0",
@@ -771,8 +800,9 @@ mod windows_host {
             "+CNMI:2,1,0,1,0",
         )
         .await;
+        let direct_report_reception = direct_report.is_ok();
         let stored_report_reception = if direct_report_reception {
-            false
+            Ok(())
         } else {
             configure_and_verify(
                 tx,
@@ -783,18 +813,24 @@ mod windows_host {
             )
             .await
         };
-        let report_reception_available = direct_report_reception || stored_report_reception;
+        let report_reception_available = direct_report_reception || stored_report_reception.is_ok();
         let mut errors = general_errors;
-        if !report_request_available {
-            errors.push("CSMP delivery-report request could not be verified".into());
+        if let Err(error) = report_request {
+            errors.push(error);
         }
-        if stored_report_reception {
-            errors.push(
-                "CNMI direct delivery reports unavailable; using stored-report synchronization"
-                    .into(),
-            );
+        if !direct_report_reception && stored_report_reception.is_ok() {
+            let reason = direct_report
+                .err()
+                .unwrap_or_else(|| "CNMI direct delivery reports could not be verified".into());
+            errors.push(format!(
+                "{reason}; using stored-report synchronization (modem storage must have free slots)"
+            ));
         } else if !report_reception_available {
-            errors.push("CNMI delivery-report reception could not be verified".into());
+            errors.push(
+                stored_report_reception.err().unwrap_or_else(|| {
+                    "CNMI delivery-report reception could not be verified".into()
+                }),
+            );
         }
         DeliveryCapability {
             attempted: true,
@@ -811,17 +847,43 @@ mod windows_host {
         set_command: &str,
         query_command: &str,
         expected: &str,
-    ) -> bool {
-        if actor_lines(tx, set_command.into(), None).await.is_err() {
-            return false;
+    ) -> Result<(), String> {
+        let mut last_error = format!("{_label} configuration could not be verified");
+        for attempt in 0..3 {
+            match actor_lines(tx, set_command.into(), None).await {
+                Ok(_) => {}
+                Err(error) => {
+                    last_error = format!("{_label} configuration failed: {error}");
+                    continue;
+                }
+            }
+            match actor_lines(tx, query_command.into(), None).await {
+                Ok(lines) if lines.iter().any(|line| setting_matches(line, expected)) => {
+                    return Ok(());
+                }
+                Ok(lines) => {
+                    let readback = lines.join(" | ");
+                    last_error = if readback.is_empty() {
+                        format!("{_label} readback was empty")
+                    } else {
+                        format!("{_label} readback did not match: {readback}")
+                    };
+                }
+                Err(error) => last_error = format!("{_label} readback failed: {error}"),
+            }
+            if attempt < 2 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
         }
-        actor_lines(tx, query_command.into(), None)
-            .await
-            .is_ok_and(|lines| {
-                lines
-                    .iter()
-                    .any(|line| line.replace(' ', "").starts_with(expected))
-            })
+        Err(last_error)
+    }
+
+    fn setting_matches(line: &str, expected: &str) -> bool {
+        line.chars()
+            .filter(|character| !character.is_ascii_whitespace())
+            .eq(expected
+                .chars()
+                .filter(|character| !character.is_ascii_whitespace()))
     }
     async fn sync_sms_json(
         tx: &mpsc::Sender<hardware::AtRequest>,
@@ -831,7 +893,40 @@ mod windows_host {
         let stamp = now();
         let records = snapshot_records(modemd::sms::parse_cmgl(&lines), stamp);
         store.sync_sms(&records, stamp).map_err(|e| e.to_string())?;
+        archive_modem_sms(tx, store, &records).await?;
         Ok(records.len())
+    }
+
+    async fn archive_modem_sms(
+        tx: &mpsc::Sender<hardware::AtRequest>,
+        store: &Store,
+        records: &[SmsRecord],
+    ) -> Result<(), String> {
+        let commands = archive_commands(records);
+        if commands.is_empty() {
+            return Ok(());
+        }
+        let count = commands.len();
+        actor_batch_lines(tx, commands, None, Duration::from_secs(90)).await?;
+        store
+            .mark_sms_archived(records)
+            .map_err(|error| error.to_string())?;
+        eprintln!("archived {count} modem SMS storage slots after durable synchronization");
+        Ok(())
+    }
+
+    fn archive_commands(records: &[SmsRecord]) -> Vec<String> {
+        let mut indices = records
+            .iter()
+            .flat_map(|record| record.storage_indices.iter().copied())
+            .filter(|index| *index > 0)
+            .collect::<Vec<_>>();
+        indices.sort_unstable_by(|left, right| right.cmp(left));
+        indices.dedup();
+        indices
+            .into_iter()
+            .map(|index| format!("AT+CMGD={index}"))
+            .collect()
     }
 
     fn snapshot_records(parsed: Vec<modemd::sms::SimSms>, stamp: i64) -> Vec<SmsRecord> {
@@ -953,22 +1048,37 @@ mod windows_host {
     async fn actor_pdu_snapshot(
         tx: &mpsc::Sender<hardware::AtRequest>,
     ) -> Result<Vec<String>, String> {
+        actor_batch_lines(
+            tx,
+            vec![
+                "AT+CPMS=\"SM\",\"SM\",\"SM\"".into(),
+                "AT+CMGF=0".into(),
+                "AT+CMGL=4".into(),
+            ],
+            Some("AT+CMGF=1".into()),
+            Duration::from_secs(35),
+        )
+        .await
+    }
+
+    async fn actor_batch_lines(
+        tx: &mpsc::Sender<hardware::AtRequest>,
+        batch: Vec<String>,
+        finalizer: Option<String>,
+        timeout: Duration,
+    ) -> Result<Vec<String>, String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         tx.send(hardware::AtRequest {
             command: String::new(),
             payload: None,
             guarded: false,
             payload_mode: PayloadMode::Sms,
-            batch: vec![
-                "AT+CPMS=\"SM\",\"SM\",\"SM\"".into(),
-                "AT+CMGF=0".into(),
-                "AT+CMGL=4".into(),
-            ],
-            finalizer: Some("AT+CMGF=1".into()),
+            batch,
+            finalizer,
             reply,
         })
         .map_err(|_| "modem command actor unavailable".to_owned())?;
-        tokio::time::timeout(Duration::from_secs(35), rx)
+        tokio::time::timeout(timeout, rx)
             .await
             .map_err(|_| "modem command timed out".to_owned())?
             .map_err(|_| "modem command actor stopped".to_owned())?
@@ -1235,9 +1345,34 @@ mod windows_host {
     #[cfg(test)]
     mod tests {
         use super::{
-            is_transient_call_release_error, is_viettel_balance_body, modem_timestamp_ms,
-            viettel_balance_message,
+            archive_commands, is_transient_call_release_error, is_viettel_balance_body,
+            modem_timestamp_ms, setting_matches, viettel_balance_message,
         };
+        use modemd::storage::SmsRecord;
+
+        #[test]
+        fn delivery_configuration_readback_ignores_modem_whitespace() {
+            assert!(setting_matches("+CNMI: 2,1,0,1,0", "+CNMI:2,1,0,1,0"));
+            assert!(!setting_matches("+CNMI: 2,1,0,2,0", "+CNMI:2,1,0,1,0"));
+        }
+
+        #[test]
+        fn archive_commands_delete_each_persisted_slot_once_in_descending_order() {
+            let records = vec![
+                SmsRecord {
+                    storage_indices: vec![1, 3],
+                    ..Default::default()
+                },
+                SmsRecord {
+                    storage_indices: vec![3, -1, 2],
+                    ..Default::default()
+                },
+            ];
+            assert_eq!(
+                archive_commands(&records),
+                ["AT+CMGD=3", "AT+CMGD=2", "AT+CMGD=1"]
+            );
+        }
 
         #[test]
         fn modem_timestamp_uses_service_centre_timezone() {

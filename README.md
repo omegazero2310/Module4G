@@ -31,6 +31,10 @@ administrators. Logs must redact phone numbers and exclude message bodies, audio
 AT output. The service scripts require an elevated PowerShell and preserve ProgramData unless
 `uninstall-service.ps1 -PurgeData` is explicitly used.
 
+The daemon treats modem SMS storage as a durable inbox queue. Synchronization commits every
+message and status report to SQLite before deleting those exact modem slots. This keeps a full `SM`
+store from blocking inbound SMS or stored delivery reports while preserving the application archive.
+
 ## Current implementation status
 
 Implemented: protobuf surface, byte-oriented framing including bare prompts, SMS/number limits,
