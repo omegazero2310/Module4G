@@ -15,6 +15,9 @@ pub struct Framer {
 pub struct Dispatcher {
     framer: Framer,
     pending_urcs: Vec<String>,
+    pending_sms_urcs: Vec<String>,
+    complete_sms_urcs: Vec<Vec<String>>,
+    awaiting_cds_pdu: Option<String>,
 }
 
 impl Dispatcher {
@@ -25,6 +28,29 @@ impl Dispatcher {
         let mut urcs = Vec::new();
         for frame in self.framer.push(bytes) {
             match frame {
+                Frame::Line(line) if self.awaiting_cds_pdu.is_some() => {
+                    let header = self.awaiting_cds_pdu.take().expect("checked above");
+                    self.pending_sms_urcs.push(line.clone());
+                    self.complete_sms_urcs.push(vec![header, line.clone()]);
+                    urcs.push(line);
+                }
+                Frame::Line(line) if line.starts_with("+CDS:") => {
+                    self.pending_sms_urcs.push(line.clone());
+                    if line
+                        .strip_prefix("+CDS:")
+                        .is_some_and(|value| value.trim().parse::<usize>().is_ok())
+                    {
+                        self.awaiting_cds_pdu = Some(line.clone());
+                    } else {
+                        self.complete_sms_urcs.push(vec![line.clone()]);
+                    }
+                    urcs.push(line);
+                }
+                Frame::Line(line) if line.starts_with("+CDSI:") || line.starts_with("+CMTI:") => {
+                    self.pending_sms_urcs.push(line.clone());
+                    self.complete_sms_urcs.push(vec![line.clone()]);
+                    urcs.push(line);
+                }
                 Frame::Line(line) if crate::call::parse_urc(&line).is_some() => urcs.push(line),
                 Frame::Line(line)
                     if command.is_some_and(|value| line.eq_ignore_ascii_case(value)) => {}
@@ -43,9 +69,20 @@ impl Dispatcher {
         self.pending_urcs.clear();
     }
 
+    pub fn take_sms_urcs(&mut self) -> Vec<String> {
+        mem::take(&mut self.pending_sms_urcs)
+    }
+
+    pub fn take_complete_sms_urcs(&mut self) -> Vec<Vec<String>> {
+        mem::take(&mut self.complete_sms_urcs)
+    }
+
     pub fn reset(&mut self) {
         self.framer.reset();
         self.pending_urcs.clear();
+        self.pending_sms_urcs.clear();
+        self.complete_sms_urcs.clear();
+        self.awaiting_cds_pdu = None;
     }
 }
 
@@ -104,6 +141,16 @@ pub fn validate_console(command: &str, busy: bool) -> Result<String, crate::Mode
             "payload or interactive commands are blocked".into(),
         ));
     }
+    for protected in ["CMGF", "CPMS", "CSMP", "CNMI"] {
+        if let Some(position) = upper.find(protected) {
+            let suffix = upper[position + protected.len()..].trim();
+            if !matches!(suffix, "?" | "=?") {
+                return Err(crate::ModemError::Validation(
+                    "SMS mode and delivery-tracking configuration is daemon-owned; query forms remain available".into(),
+                ));
+            }
+        }
+    }
     Ok(command.to_owned())
 }
 
@@ -125,6 +172,9 @@ mod tests {
     fn console_is_guarded() {
         assert_eq!(validate_console("AT+CSQ", false).unwrap(), "AT+CSQ");
         assert!(validate_console("AT+CMGS=1", false).is_err());
+        assert!(validate_console("AT+CNMI=2,1,0,2,0", false).is_err());
+        assert!(validate_console("AT+CSMP=49,167,0,0", false).is_err());
+        assert_eq!(validate_console("AT+CNMI?", false).unwrap(), "AT+CNMI?");
         assert!(validate_console("AT\rD", false).is_err());
     }
     #[test]
@@ -134,6 +184,54 @@ mod tests {
         assert_eq!(response, vec![Frame::Line("OK".into())]);
         assert_eq!(urcs, vec!["VOICE CALL: BEGIN"]);
         assert_eq!(d.take_urcs(), vec!["VOICE CALL: BEGIN"]);
+    }
+    #[test]
+    fn dispatcher_keeps_split_sms_reports_out_of_responses() {
+        let mut d = Dispatcher::default();
+        let (first, _) = d.push(b"+CDSI: \"SM\",7\r\n+CDS: 24\r\n0011", Some("AT+CSQ"));
+        assert!(first.is_empty());
+        let (second, _) = d.push(b"2233\r\n+CSQ: 10,99\r\nOK\r\n", Some("AT+CSQ"));
+        assert_eq!(
+            second,
+            vec![Frame::Line("+CSQ: 10,99".into()), Frame::Line("OK".into())]
+        );
+        assert_eq!(
+            d.take_sms_urcs(),
+            vec!["+CDSI: \"SM\",7", "+CDS: 24", "00112233"]
+        );
+    }
+    #[test]
+    fn dispatcher_does_not_swallow_command_result_after_text_mode_cds() {
+        let mut d = Dispatcher::default();
+        let input = b"+CDS: 2,42,\"+66812345678\",145,\"26/08/04,12:00:00+00\",\"26/08/04,12:01:00+00\",0\r\n+CMGS: 42\r\nOK\r\n";
+        let (response, _) = d.push(input, Some("AT+CMGS=\"+66812345678\""));
+        assert_eq!(
+            response,
+            vec![Frame::Line("+CMGS: 42".into()), Frame::Line("OK".into())]
+        );
+        assert_eq!(
+            d.take_complete_sms_urcs(),
+            vec![vec![
+                String::from_utf8_lossy(input)
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .trim_end_matches('\r')
+                    .to_owned()
+            ]]
+        );
+    }
+
+    #[test]
+    fn dispatcher_emits_fragmented_pdu_report_only_when_complete() {
+        let mut d = Dispatcher::default();
+        d.push(b"+CDS: 24\r\n0011", None);
+        assert!(d.take_complete_sms_urcs().is_empty());
+        d.push(b"2233\r\n", None);
+        assert_eq!(
+            d.take_complete_sms_urcs(),
+            vec![vec![String::from("+CDS: 24"), String::from("00112233")]]
+        );
     }
     proptest::proptest! {
         #[test] fn arbitrary_bytes_never_panic(chunks in proptest::collection::vec(proptest::collection::vec(any::<u8>(), 0..64), 0..30)) {

@@ -115,6 +115,8 @@ struct Status {
     registration: String,
     signal_rssi: i32,
     last_error: String,
+    delivery_tracking_available: bool,
+    delivery_tracking_error: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -214,6 +216,10 @@ struct Record {
     service_center: String,
     message_reference: String,
     delivery_status: String,
+    delivery_report_requested: bool,
+    delivery_report_scts: String,
+    delivery_report_discharge_time: String,
+    delivery_tracking_error: String,
     synchronized_at_ms: i64,
     present_on_modem: bool,
     sms_id: String,
@@ -281,6 +287,10 @@ impl Default for Record {
             service_center: String::new(),
             message_reference: String::new(),
             delivery_status: String::new(),
+            delivery_report_requested: false,
+            delivery_report_scts: String::new(),
+            delivery_report_discharge_time: String::new(),
+            delivery_tracking_error: String::new(),
             synchronized_at_ms: 0,
             present_on_modem: false,
             sms_id: String::new(),
@@ -351,11 +361,23 @@ async fn request_line(request: &str) -> Result<String, String> {
 #[tauri::command]
 async fn get_status() -> Result<Status, String> {
     let response = request_line("STATUS").await?;
-    let fields: Vec<_> = response.trim_end().split('\t').collect();
-    if fields.len() != 7 || fields[0] != "STATUS" {
+    let status = parse_status_response(&response)?;
+    log_status_change(&status);
+    Ok(status)
+}
+
+fn parse_status_response(response: &str) -> Result<Status, String> {
+    // Preserve a trailing empty delivery-tracking error field. `trim_end()`
+    // would remove its tab as whitespace and turn a valid nine-field response
+    // into eight fields. Seven fields are accepted for older services.
+    let fields: Vec<_> = response
+        .trim_end_matches(['\r', '\n'])
+        .split('\t')
+        .collect();
+    if !matches!(fields.len(), 7 | 9) || fields[0] != "STATUS" {
         return Err("The modem service returned an invalid status response.".into());
     }
-    let status = Status {
+    Ok(Status {
         service_version: fields[1].into(),
         state: fields[2].into(),
         port: fields[3].into(),
@@ -363,9 +385,9 @@ async fn get_status() -> Result<Status, String> {
         registration: fields[5].into(),
         signal_rssi: fields[6].parse().map_err(|_| "Invalid signal value")?,
         last_error: String::new(),
-    };
-    log_status_change(&status);
-    Ok(status)
+        delivery_tracking_available: fields.get(7).is_some_and(|value| *value == "true"),
+        delivery_tracking_error: fields.get(8).copied().unwrap_or_default().into(),
+    })
 }
 
 #[cfg(windows)]
@@ -674,6 +696,20 @@ async fn list_calls(_state: tauri::State<'_, AppState>) -> Result<Vec<Record>, S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_parser_accepts_legacy_and_extended_responses() {
+        let legacy =
+            parse_status_response("STATUS\t0.1.0\tReady\tCOM6\tREADY\tRegistered\t18\n").unwrap();
+        assert!(!legacy.delivery_tracking_available);
+        assert!(legacy.delivery_tracking_error.is_empty());
+
+        let extended =
+            parse_status_response("STATUS\t0.1.0\tReady\tCOM6\tREADY\tRegistered\t18\ttrue\t\n")
+                .unwrap();
+        assert!(extended.delivery_tracking_available);
+        assert!(extended.delivery_tracking_error.is_empty());
+    }
 
     #[test]
     fn console_logging_redacts_private_request_data() {

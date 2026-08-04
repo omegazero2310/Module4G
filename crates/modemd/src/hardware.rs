@@ -17,7 +17,8 @@ use std::{
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
-const SMS_SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
+const SMS_PROMPT_TIMEOUT: Duration = Duration::from_secs(2);
+const SMS_SUBMIT_TIMEOUT: Duration = Duration::from_secs(40);
 const RAW_PROMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const RAW_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
 const INTERACTIVE_RESYNC_WINDOW: Duration = Duration::from_millis(300);
@@ -25,11 +26,8 @@ const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const INITIALIZATION_COMMANDS: &[&str] = &["AT+CMEE=2", "AT+CVHU=0", "AT+CMGF=1"];
 const OPTIONAL_INITIALIZATION_COMMANDS: &[&str] = &[
     "AT+CLCC=1",
-    // Select SIM storage before enabling stored-message and stored-report URCs.
     "AT+CPMS=\"SM\",\"SM\",\"SM\"",
-    "AT+CNMI=2,1,0,2,0",
-    // TP-SRR requests a network delivery report for SMS-SUBMIT messages.
-    "AT+CSMP=49,167,0,0",
+    "AT+CPMS?",
     "AT+CSDH=1",
 ];
 
@@ -77,6 +75,12 @@ pub enum HardwareState {
     Ready { port_name: String },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SmsUrcEvent {
+    DirectReport(Vec<String>),
+    StoredIndication(String),
+}
+
 pub struct AtRequest {
     pub command: String,
     pub payload: Option<Vec<u8>>,
@@ -119,7 +123,8 @@ impl InitializedModem {
 /// no second process can claim the AT port between initialization and use.
 pub fn monitor(settings: Settings, stop: Arc<AtomicBool>, mut report: impl FnMut(HardwareState)) {
     let (_sender, receiver) = mpsc::channel();
-    monitor_with_commands(settings, stop, &mut report, receiver);
+    let (sms_sender, _sms_receiver) = mpsc::channel();
+    monitor_with_commands(settings, stop, &mut report, receiver, sms_sender);
 }
 
 /// Owns the serial port and executes guarded console requests sequentially.
@@ -128,6 +133,7 @@ pub fn monitor_with_commands(
     stop: Arc<AtomicBool>,
     mut report: impl FnMut(HardwareState),
     commands: mpsc::Receiver<AtRequest>,
+    sms_events: mpsc::Sender<SmsUrcEvent>,
 ) {
     let mut modem: Option<InitializedModem> = None;
     let mut dispatcher = Dispatcher::default();
@@ -160,10 +166,26 @@ pub fn monitor_with_commands(
                             )
                         })
                     };
+                    publish_sms_events(&mut dispatcher, &sms_events);
                     let _ = request.reply.send(result);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => thread::sleep(DEVICE_POLL_INTERVAL),
+            }
+            // The serial actor remains the sole reader even while idle. This
+            // prevents unsolicited delivery reports from filling the driver
+            // buffer or being mistaken for a later command response.
+            if let Some(connected) = modem.as_mut() {
+                let mut buffer = [0_u8; 256];
+                match connected.port().read(&mut buffer) {
+                    Ok(count) if count > 0 => {
+                        let _ = dispatcher.push(&buffer[..count], None);
+                        publish_sms_events(&mut dispatcher, &sms_events);
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == io::ErrorKind::TimedOut => {}
+                    Err(_) => modem = None,
+                }
             }
             continue;
         }
@@ -186,6 +208,22 @@ pub fn monitor_with_commands(
         }
         thread::sleep(DEVICE_POLL_INTERVAL);
     }
+}
+
+fn publish_sms_events(dispatcher: &mut Dispatcher, sender: &mpsc::Sender<SmsUrcEvent>) {
+    for event in dispatcher.take_complete_sms_urcs() {
+        let typed = if event.first().is_some_and(|line| line.starts_with("+CDS:")) {
+            SmsUrcEvent::DirectReport(event)
+        } else if let Some(line) = event.into_iter().next() {
+            SmsUrcEvent::StoredIndication(line)
+        } else {
+            continue;
+        };
+        let _ = sender.send(typed);
+    }
+    // Complete events have their own owned lines; this legacy buffer is only
+    // retained for callers/tests that explicitly inspect it.
+    let _ = dispatcher.take_sms_urcs();
 }
 
 fn run_batch<F>(
@@ -242,6 +280,9 @@ fn execute_command(
             dispatcher,
         );
     }
+    if let (Some(payload), PayloadMode::Sms) = (payload, payload_mode) {
+        return execute_sms_submit(port, command, payload, dispatcher);
+    }
     port.write_all(command.as_bytes())
         .map_err(|_| ModemError::Disconnected)?;
     port.write_all(b"\r")
@@ -264,6 +305,14 @@ fn execute_command(
                             continue;
                         }
                         if line == "OK" {
+                            if command.eq_ignore_ascii_case("AT+CMGL=4") {
+                                lines.extend(dispatcher.take_sms_urcs().into_iter().filter(
+                                    |line| {
+                                        line.starts_with("+CDS:")
+                                            || line.bytes().all(|byte| byte.is_ascii_hexdigit())
+                                    },
+                                ));
+                            }
                             return Ok(lines);
                         }
                         if line == "ERROR"
@@ -299,6 +348,134 @@ fn execute_command(
         }
     }
     Err(ModemError::Timeout)
+}
+
+fn execute_sms_submit(
+    port: &mut dyn SerialPort,
+    command: &str,
+    payload: &[u8],
+    dispatcher: &mut Dispatcher,
+) -> Result<Vec<String>, ModemError> {
+    execute_sms_submit_with_deadlines(
+        port,
+        command,
+        payload,
+        dispatcher,
+        SMS_PROMPT_TIMEOUT,
+        SMS_SUBMIT_TIMEOUT,
+        INTERACTIVE_RESYNC_WINDOW,
+    )
+}
+
+fn execute_sms_submit_with_deadlines(
+    port: &mut dyn SerialPort,
+    command: &str,
+    payload: &[u8],
+    dispatcher: &mut Dispatcher,
+    prompt_timeout: Duration,
+    result_timeout: Duration,
+    resync_window: Duration,
+) -> Result<Vec<String>, ModemError> {
+    let started = Instant::now();
+    port.write_all(command.as_bytes())
+        .map_err(|_| ModemError::Disconnected)?;
+    port.write_all(b"\r")
+        .map_err(|_| ModemError::Disconnected)?;
+    port.flush().map_err(|_| ModemError::Disconnected)?;
+    let mut buffer = [0_u8; 256];
+    let prompt_deadline = Instant::now() + prompt_timeout;
+    loop {
+        if Instant::now() >= prompt_deadline {
+            let resynchronized = resynchronize_interactive(port, dispatcher, resync_window);
+            eprintln!(
+                "sms_submit_phase=prompt status=timeout elapsed_ms={} resynchronized={resynchronized}",
+                started.elapsed().as_millis()
+            );
+            return Err(ModemError::SmsSubmitTimeout {
+                phase: "before the payload prompt",
+                resynchronized,
+            });
+        }
+        match port.read(&mut buffer) {
+            Ok(0) => {}
+            Ok(count) => {
+                let (frames, _) = dispatcher.push(&buffer[..count], Some(command));
+                let mut prompted = false;
+                for frame in frames {
+                    match frame {
+                        Frame::Prompt => prompted = true,
+                        Frame::Line(line) if is_rejection(&line) => {
+                            return Err(ModemError::CommandRejected(line));
+                        }
+                        _ => {}
+                    }
+                }
+                if prompted {
+                    break;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => {}
+            Err(_) => return Err(ModemError::Disconnected),
+        }
+    }
+    port.write_all(payload)
+        .map_err(|_| ModemError::Disconnected)?;
+    port.write_all(&[0x1a])
+        .map_err(|_| ModemError::Disconnected)?;
+    port.flush().map_err(|_| ModemError::Disconnected)?;
+    eprintln!(
+        "sms_submit_phase=payload status=sent bytes={} elapsed_ms={}",
+        payload.len(),
+        started.elapsed().as_millis()
+    );
+
+    let result_deadline = Instant::now() + result_timeout;
+    let mut lines = Vec::new();
+    let mut got_reference = false;
+    let mut got_ok = false;
+    loop {
+        if got_reference && got_ok {
+            eprintln!(
+                "sms_submit_phase=result status=accepted elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
+            return Ok(lines);
+        }
+        if Instant::now() >= result_deadline {
+            let resynchronized = resynchronize_interactive(port, dispatcher, resync_window);
+            eprintln!(
+                "sms_submit_phase=result status=timeout elapsed_ms={} resynchronized={resynchronized}",
+                started.elapsed().as_millis()
+            );
+            return Err(ModemError::SmsSubmitTimeout {
+                phase: "after payload transmission",
+                resynchronized,
+            });
+        }
+        match port.read(&mut buffer) {
+            Ok(0) => {}
+            Ok(count) => {
+                let (frames, _) = dispatcher.push(&buffer[..count], Some(command));
+                for frame in frames {
+                    if let Frame::Line(line) = frame {
+                        if is_rejection(&line) {
+                            return Err(ModemError::CommandRejected(line));
+                        }
+                        if line.starts_with("+CMGS:") {
+                            got_reference = true;
+                            lines.push(line);
+                        } else if line == "OK" {
+                            got_ok = true;
+                        } else {
+                            lines.push(line);
+                        }
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => {}
+            Err(_) => return Err(ModemError::Disconnected),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -670,7 +847,9 @@ fn initialize(port: &mut dyn SerialPort) -> Result<(), HardwareError> {
         send_expect_ok(port, command, COMMAND_TIMEOUT)?;
     }
     for command in OPTIONAL_INITIALIZATION_COMMANDS {
-        let _ = send_expect_ok(port, command, COMMAND_TIMEOUT);
+        if let Err(error) = send_expect_ok(port, command, COMMAND_TIMEOUT) {
+            eprintln!("optional modem initialization failed for {command}: {error}");
+        }
     }
     Ok(())
 }
@@ -943,8 +1122,7 @@ mod tests {
             [
                 "AT+CLCC=1",
                 "AT+CPMS=\"SM\",\"SM\",\"SM\"",
-                "AT+CNMI=2,1,0,2,0",
-                "AT+CSMP=49,167,0,0",
+                "AT+CPMS?",
                 "AT+CSDH=1"
             ]
         );
@@ -1023,6 +1201,56 @@ mod tests {
         );
         assert_eq!(writes.concat(), payload);
         assert_ne!(writes.last().and_then(|chunk| chunk.last()), Some(&0x1a));
+    }
+
+    #[test]
+    fn sms_submission_completes_on_cmgs_and_ok_with_interleaved_text_report() {
+        let mut port = ScriptedPort::new([
+            ReadStep::Bytes(b"\r\n> ".to_vec()),
+            ReadStep::Bytes(b"+CDS: 2,7,\"+66812345678\",145,\"26/08/04,12:00:00+00\",\"26/08/04,12:01:00+00\",0\r\n+CMGS: 8\r\nOK\r\n".to_vec()),
+        ]);
+        let mut dispatcher = Dispatcher::default();
+        let lines = execute_sms_submit_with_deadlines(
+            &mut port,
+            "AT+CMGS=\"+66812345678\"",
+            b"hello",
+            &mut dispatcher,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(lines, vec!["+CMGS: 8"]);
+        assert_eq!(port.writes[2], b"hello");
+        assert_eq!(port.writes[3], [0x1a]);
+        assert_eq!(dispatcher.take_complete_sms_urcs().len(), 1);
+    }
+
+    #[test]
+    fn sms_result_timeout_resynchronizes_before_next_command() {
+        let mut port = ScriptedPort::new([
+            ReadStep::Bytes(b"\r\n> ".to_vec()),
+            ReadStep::Timeout,
+            ReadStep::Bytes(b"+CMGS: 8\r\nOK\r\n".to_vec()),
+        ]);
+        let error = execute_sms_submit_with_deadlines(
+            &mut port,
+            "AT+CMGS=\"+66812345678\"",
+            b"hello",
+            &mut Dispatcher::default(),
+            Duration::from_millis(5),
+            Duration::from_millis(1),
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ModemError::SmsSubmitTimeout {
+                phase: "after payload transmission",
+                ..
+            }
+        ));
+        assert!(port.clears.load(Ordering::Relaxed) >= 2);
     }
 
     #[test]

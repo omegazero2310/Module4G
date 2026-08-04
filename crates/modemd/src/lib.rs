@@ -34,6 +34,11 @@ pub enum ModemError {
     Disconnected,
     #[error("command timed out")]
     Timeout,
+    #[error("SMS submission timed out {phase}; parser resynchronized: {resynchronized}")]
+    SmsSubmitTimeout {
+        phase: &'static str,
+        resynchronized: bool,
+    },
     #[error(
         "raw upload timed out {phase} ({bytes_sent} byte(s), {chunks_sent} chunk(s), {pacing_ms} ms pacing, {elapsed_ms} ms elapsed; parser resynchronized: {resynchronized})"
     )]
@@ -61,7 +66,9 @@ impl From<ModemError> for tonic::Status {
             ModemError::Validation(message) => tonic::Status::invalid_argument(message),
             ModemError::Busy => tonic::Status::resource_exhausted(error.to_string()),
             ModemError::Disconnected => tonic::Status::unavailable(error.to_string()),
-            ModemError::Timeout | ModemError::RawUploadTimeout { .. } => {
+            ModemError::Timeout
+            | ModemError::SmsSubmitTimeout { .. }
+            | ModemError::RawUploadTimeout { .. } => {
                 tonic::Status::deadline_exceeded(error.to_string())
             }
             ModemError::SimUnavailable

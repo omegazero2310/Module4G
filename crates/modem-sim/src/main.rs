@@ -243,8 +243,10 @@ mod windows_sim {
                     "send-failed"
                 } else if peer.ends_with("92") {
                     "send-unknown"
-                } else {
+                } else if peer.ends_with("95") {
                     "submitted"
+                } else {
+                    "delivery-pending"
                 };
                 let record = sms_record(
                     &format!("sim-sms-{}", state.sms.len() + 1),
@@ -259,7 +261,7 @@ mod windows_sim {
                     1785726000000,
                 );
                 state.sms.insert(0, record.clone());
-                if state_name == "submitted" {
+                if matches!(state_name, "submitted" | "delivery-pending") {
                     serde_json::json!({"ok":true,"data":record})
                 } else {
                     serde_json::json!({"ok":false,"error":if state_name=="send-failed"{"modem rejected command: +CMS ERROR: 500"}else{"modem command timed out; send result unknown"}})
@@ -272,11 +274,13 @@ mod windows_sim {
                         sms["state"] = "read".into();
                         sms["modemStatus"] = "REC READ".into();
                     }
-                    if sms["state"] == "submitted" && state.sms_polls >= 1 {
-                        sms["state"] = "delivery-pending".into();
-                        sms["deliveryStatus"] = "0x20".into();
-                    }
-                    if sms["state"] == "delivery-pending" && state.sms_polls >= 2 {
+                    let peer = sms["peer"].as_str().unwrap_or_default();
+                    let delayed = peer.ends_with("96");
+                    let missing = peer.ends_with("93");
+                    if sms["state"] == "delivery-pending"
+                        && !missing
+                        && state.sms_polls >= if delayed { 4 } else { 2 }
+                    {
                         sms["state"] = if sms["peer"]
                             .as_str()
                             .is_some_and(|peer| peer.ends_with("94"))
@@ -346,7 +350,7 @@ mod windows_sim {
         modem_timestamp: &str,
         created_at_ms: i64,
     ) -> serde_json::Value {
-        serde_json::json!({"id":id,"direction":direction,"peer":peer,"body":body,"state":state,"detail":"","createdAtMs":created_at_ms,"answerClassification":"","endReason":"","releaseCause":"","kind":kind,"source":source,"storage":if source=="sim"{"SM"}else{""},"storageIndex":if source=="sim"{1}else{-1},"storageIndices":if source=="sim"{vec![1]}else{vec![]},"partCount":1,"partsReceived":1,"multipartComplete":true,"modemStatus":if state=="unread"{"REC UNREAD"}else{""},"modemTimestamp":modem_timestamp,"encoding":"GSM-7","dcs":0,"length":body.chars().count(),"serviceCenter":"","messageReference":message_reference,"deliveryStatus":"","synchronizedAtMs":created_at_ms,"presentOnModem":source=="sim","smsId":"","audioId":"","error":"","durationSeconds":0,"connectedAtMs":0,"endedAtMs":0})
+        serde_json::json!({"id":id,"direction":direction,"peer":peer,"body":body,"state":state,"detail":"","cause":"","createdAtMs":created_at_ms,"answerClassification":"","endReason":"","releaseCause":"","kind":kind,"source":source,"storage":if source=="sim"{"SM"}else{""},"storageIndex":if source=="sim"{1}else{-1},"storageIndices":if source=="sim"{vec![1]}else{vec![]},"partCount":1,"partsReceived":1,"multipartComplete":true,"modemStatus":if state=="unread"{"REC UNREAD"}else{""},"modemTimestamp":modem_timestamp,"encoding":"GSM-7","dcs":0,"length":body.chars().count(),"serviceCenter":"","messageReference":message_reference,"deliveryStatus":"","deliveryReportRequested":source=="app"&&state!="submitted","deliveryReportScts":"","deliveryReportDischargeTime":"","deliveryTrackingError":if source=="app"&&state=="submitted"{"simulated tracking configuration degradation"}else{""},"synchronizedAtMs":created_at_ms,"presentOnModem":source=="sim","smsId":"","audioId":"","error":"","durationSeconds":0,"connectedAtMs":0,"endedAtMs":0})
     }
 
     fn response(command: &str, scenario: &mut CallScenario) -> &'static str {
@@ -409,9 +413,10 @@ mod windows_sim {
         }
         match command {
             "STATUS" => "STATUS\t0.1.0-sim\tReady\tSIMULATED\tREADY\tRegistered\t20\n",
-            "AT" | "AT+CMEE=2" | "AT+CVHU=0" | "AT+CLCC=1" | "AT+CMGF=1" | "AT+CNMI=1,1,0,1,0" => {
-                "OK\n"
-            }
+            "AT" | "AT+CMEE=2" | "AT+CVHU=0" | "AT+CLCC=1" | "AT+CMGF=1" | "AT+CNMI=2,1,0,1,0"
+            | "AT+CSMP=49,167,0,0" => "OK\n",
+            "AT+CNMI?" => "+CNMI: 2,1,0,1,0\r\nOK\n",
+            "AT+CSMP?" => "+CSMP: 49,167,0,0\r\nOK\n",
             "ATI" => "SIMCOM_Ltd\r\nSIMCOM_SIM7600G-H\r\nRevision: A7670M7_V1.11\r\nOK\n",
             "AT+CSQ" => "+CSQ: 20,99\r\nOK\n",
             "AT+CPIN?" => "+CPIN: READY\r\nOK\n",

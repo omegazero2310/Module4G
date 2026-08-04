@@ -40,6 +40,8 @@ message Status {
   int32 signal_rssi = 8;
   string last_error = 9;
   uint32 queued_operations = 10;
+  bool delivery_tracking_available = 11;
+  string delivery_tracking_error = 12;
 }
 enum ModemState { MODEM_STATE_UNSPECIFIED = 0; DISCONNECTED_STATE = 1; PORT_BUSY_STATE = 2; INITIALIZING_STATE = 3; READY_STATE = 4; ERROR_STATE = 5; }
 message Port { string name = 1; uint32 vid = 2; uint32 pid = 3; string label = 4; bool available = 5; bool dedicated_at = 6; }
@@ -62,8 +64,8 @@ message ExecuteAtResponse { repeated string lines = 1; }
 message Operation { string id = 1; string state = 2; }
 message ListRequest { uint32 limit = 1; string cursor = 2; }
 // state: sending, submitted, send-failed, send-unknown,
-// delivery-pending, delivered, delivery-failed, or an inbound/SIM state.
-message Sms { string id = 1; string direction = 2; string peer = 3; string body = 4; string state = 5; int64 created_at_ms = 6; string message_reference = 7; string cause = 8; string kind = 9; string source = 10; string storage = 11; int32 storage_index = 12; string modem_status = 13; string modem_timestamp = 14; string encoding = 15; int32 dcs = 16; int32 length = 17; string service_center = 18; string delivery_status = 19; int64 synchronized_at_ms = 20; bool present_on_modem = 21; repeated int32 storage_indices = 22; int32 part_count = 23; int32 parts_received = 24; bool multipart_complete = 25; }
+// delivery-pending, delivered, delivery-failed, delivery-unknown, or an inbound/SIM state.
+message Sms { string id = 1; string direction = 2; string peer = 3; string body = 4; string state = 5; int64 created_at_ms = 6; string message_reference = 7; string cause = 8; string kind = 9; string source = 10; string storage = 11; int32 storage_index = 12; string modem_status = 13; string modem_timestamp = 14; string encoding = 15; int32 dcs = 16; int32 length = 17; string service_center = 18; string delivery_status = 19; int64 synchronized_at_ms = 20; bool present_on_modem = 21; repeated int32 storage_indices = 22; int32 part_count = 23; int32 parts_received = 24; bool multipart_complete = 25; bool delivery_report_requested = 26; string delivery_report_scts = 27; string delivery_report_discharge_time = 28; string delivery_tracking_error = 29; }
 message SmsList { repeated Sms records = 1; string next_cursor = 2; }
 enum AnswerClassification {
   reserved 1, 2, 3;

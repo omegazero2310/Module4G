@@ -24,6 +24,7 @@ pub struct SimSms {
     pub length: i32,
     pub service_center: String,
     pub message_reference: String,
+    pub discharge_time: String,
     pub delivery_status: String,
     #[serde(skip)]
     concat: Option<Concat>,
@@ -51,13 +52,49 @@ pub fn parse_cmgl(lines: &[String]) -> Vec<SimSms> {
                     normalize_modem_status(fields.get(1).map(String::as_str).unwrap_or_default()),
                 )
             });
-        } else if !matches!(line.trim(), "" | "OK" | "ERROR") {
+        } else if let Some(record) = parse_text_cds(line) {
+            physical.push(record);
+            header = None;
+        } else if let Some(value) = line.strip_prefix("+CDS:") {
+            // Direct status reports use the same PDU representation as stored
+            // reports. A synthetic index keeps them auditable without
+            // pretending they occupy SIM storage.
+            let _length = value.trim().parse::<usize>().ok();
+            header = Some((-1, "DIRECT REPORT".into()));
+        } else if !line.starts_with("+CDSI:") && !matches!(line.trim(), "" | "OK" | "ERROR") {
             if let Some((index, status)) = header.take() {
                 physical.push(decode_pdu(index, status, line.trim()));
             }
         }
     }
     assemble(physical)
+}
+
+/// Parse the single-line text-mode form of a direct `+CDS` status report.
+/// PDU-mode headers contain only a length and deliberately return `None`.
+pub fn parse_text_cds(line: &str) -> Option<SimSms> {
+    let fields = quoted_csv(line.strip_prefix("+CDS:")?.trim());
+    if fields.len() < 7 {
+        return None;
+    }
+    let message_reference = fields.get(1)?.parse::<u8>().ok()?.to_string();
+    let status = fields.last()?.parse::<u8>().ok()?;
+    Some(SimSms {
+        index: -1,
+        storage_indices: vec![-1],
+        part_count: 1,
+        parts_received: 1,
+        multipart_complete: true,
+        modem_status: "DIRECT REPORT".into(),
+        direction: "inbound".into(),
+        kind: "status-report".into(),
+        peer: fields.get(2).cloned().unwrap_or_default(),
+        message_reference,
+        modem_timestamp: fields.get(4).cloned().unwrap_or_default(),
+        discharge_time: fields.get(5).cloned().unwrap_or_default(),
+        delivery_status: format!("0x{status:02X}"),
+        ..Default::default()
+    })
 }
 
 fn normalize_modem_status(value: &str) -> String {
@@ -188,13 +225,14 @@ fn parse_status_report(p: &mut Cursor<'_>) -> Option<SimSms> {
     let mr = p.byte()?;
     let peer = p.address()?;
     let timestamp = decode_timestamp(p.take(7)?);
-    let _discharge = p.take(7)?;
+    let discharge_time = decode_timestamp(p.take(7)?);
     let status = p.byte()?;
     Some(SimSms {
         direction: "inbound".into(),
         kind: "status-report".into(),
         peer,
         modem_timestamp: timestamp,
+        discharge_time,
         message_reference: mr.to_string(),
         delivery_status: format!("0x{status:02X}"),
         encoding: "status".into(),
@@ -660,6 +698,28 @@ mod tests {
         let unsent = parse_cmgl(&["+CMGL: 3,2,,4".into(), "XYZ".into()]);
         assert_eq!(sent[0].modem_status, "STO SENT");
         assert_eq!(unsent[0].modem_status, "STO UNSENT");
+    }
+    #[test]
+    fn parses_direct_status_report_and_preserves_both_timestamps() {
+        let pdu = "00022A039166F8628040210000006280402200000000";
+        let records = parse_cmgl(&["+CDS: 21".into(), pdu.into()]);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].kind, "status-report");
+        assert_eq!(records[0].message_reference, "42");
+        assert_eq!(records[0].modem_timestamp, "26/08/04,12:00:00+00");
+        assert_eq!(records[0].discharge_time, "26/08/04,22:00:00+00");
+        assert_eq!(records[0].delivery_status, "0x00");
+    }
+    #[test]
+    fn parses_single_line_text_mode_status_report() {
+        let records = parse_cmgl(&[
+            "+CDS: 2,42,\"+66812345678\",145,\"26/08/04,12:00:00+00\",\"26/08/04,12:01:00+00\",0"
+                .into(),
+        ]);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].message_reference, "42");
+        assert_eq!(records[0].peer, "+66812345678");
+        assert_eq!(records[0].delivery_status, "0x00");
     }
     #[test]
     fn assembles_out_of_order_ucs2_without_changing_whitespace() {

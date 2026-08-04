@@ -93,6 +93,10 @@ impl CallManager {
             .is_some()
     }
 
+    pub fn sms_sync_allowed(&self) -> bool {
+        !self.call_active() && !self.uploading.load(Ordering::Acquire)
+    }
+
     pub async fn upload_audio(
         &self,
         name: String,

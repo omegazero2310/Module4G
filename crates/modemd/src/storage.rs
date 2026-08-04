@@ -32,6 +32,10 @@ pub struct SmsRecord {
     pub length: i32,
     pub service_center: String,
     pub delivery_status: String,
+    pub delivery_report_requested: bool,
+    pub delivery_report_scts: String,
+    pub delivery_report_discharge_time: String,
+    pub delivery_tracking_error: String,
     pub synchronized_at_ms: i64,
     pub present_on_modem: bool,
     pub fingerprint: String,
@@ -214,6 +218,30 @@ impl Store {
              CREATE UNIQUE INDEX sms_sim_fingerprint ON sms(storage,fingerprint) WHERE source='sim';
              INSERT OR IGNORE INTO schema_migrations(version) VALUES (7);",
         ).map_err(db_error)?;
+        let sms_columns = table_columns(&connection, "sms")?;
+        for (name, definition) in [
+            ("delivery_report_requested", "INTEGER NOT NULL DEFAULT 0"),
+            ("delivery_report_scts", "TEXT NOT NULL DEFAULT ''"),
+            ("delivery_report_discharge_time", "TEXT NOT NULL DEFAULT ''"),
+            ("delivery_tracking_error", "TEXT NOT NULL DEFAULT ''"),
+            ("matched_sms_id", "TEXT NOT NULL DEFAULT ''"),
+            ("delivery_event_ms", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            if !sms_columns.iter().any(|column| column == name) {
+                connection
+                    .execute(
+                        &format!("ALTER TABLE sms ADD COLUMN {name} {definition}"),
+                        [],
+                    )
+                    .map_err(db_error)?;
+            }
+        }
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO schema_migrations(version) VALUES (8)",
+                [],
+            )
+            .map_err(db_error)?;
         Ok(())
     }
 
@@ -403,8 +431,32 @@ impl Store {
         ).map_err(db_error)
     }
 
+    pub fn next_sms_sync_delay_ms(&self, now_ms: i64) -> Result<u64, ModemError> {
+        let _ = now_ms;
+        Ok(300_000)
+    }
+
+    pub fn expire_delivery_reports(&self, now_ms: i64) -> Result<usize, ModemError> {
+        self.connection()?.execute(
+            "UPDATE sms SET state='delivery-unknown',cause='no final delivery report was received within the 24-hour validity period' WHERE source='app' AND direction='outbound' AND state='delivery-pending' AND created_at_ms<=?1",
+            [now_ms.saturating_sub(86_400_000)],
+        ).map_err(db_error)
+    }
+
+    pub fn apply_direct_delivery_report(
+        &self,
+        report: &SmsRecord,
+        now_ms: i64,
+    ) -> Result<bool, ModemError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction().map_err(db_error)?;
+        let matched = apply_delivery_reports(&transaction, std::slice::from_ref(report), now_ms)?;
+        transaction.commit().map_err(db_error)?;
+        Ok(matched != 0)
+    }
+
     pub fn save_sms(&self, r: &SmsRecord) -> Result<(), ModemError> {
-        self.connection()?.execute("INSERT INTO sms(id,direction,peer,body,state,message_reference,cause,created_at_ms,kind,source,storage,storage_index,modem_status,modem_timestamp,encoding,dcs,length,service_center,delivery_status,synchronized_at_ms,present_on_modem,fingerprint,storage_indices,part_count,parts_received,multipart_complete) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26) ON CONFLICT(id) DO UPDATE SET state=excluded.state,message_reference=excluded.message_reference,cause=excluded.cause,delivery_status=excluded.delivery_status,synchronized_at_ms=excluded.synchronized_at_ms,present_on_modem=excluded.present_on_modem",params![r.id,r.direction,r.peer,r.body,r.state,r.message_reference,r.cause,r.created_at_ms,r.kind,r.source,r.storage,r.storage_index,r.modem_status,r.modem_timestamp,r.encoding,r.dcs,r.length,r.service_center,r.delivery_status,r.synchronized_at_ms,r.present_on_modem,r.fingerprint,serde_json::to_string(&r.storage_indices).map_err(db_error)?,r.part_count,r.parts_received,r.multipart_complete]).map_err(db_error)?;
+        self.connection()?.execute("INSERT INTO sms(id,direction,peer,body,state,message_reference,cause,created_at_ms,kind,source,storage,storage_index,modem_status,modem_timestamp,encoding,dcs,length,service_center,delivery_status,synchronized_at_ms,present_on_modem,fingerprint,storage_indices,part_count,parts_received,multipart_complete,delivery_report_requested,delivery_report_scts,delivery_report_discharge_time,delivery_tracking_error) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30) ON CONFLICT(id) DO UPDATE SET state=excluded.state,message_reference=excluded.message_reference,cause=excluded.cause,delivery_status=excluded.delivery_status,synchronized_at_ms=excluded.synchronized_at_ms,present_on_modem=excluded.present_on_modem,delivery_report_requested=excluded.delivery_report_requested,delivery_report_scts=excluded.delivery_report_scts,delivery_report_discharge_time=excluded.delivery_report_discharge_time,delivery_tracking_error=excluded.delivery_tracking_error",params![r.id,r.direction,r.peer,r.body,r.state,r.message_reference,r.cause,r.created_at_ms,r.kind,r.source,r.storage,r.storage_index,r.modem_status,r.modem_timestamp,r.encoding,r.dcs,r.length,r.service_center,r.delivery_status,r.synchronized_at_ms,r.present_on_modem,r.fingerprint,serde_json::to_string(&r.storage_indices).map_err(db_error)?,r.part_count,r.parts_received,r.multipart_complete,r.delivery_report_requested,r.delivery_report_scts,r.delivery_report_discharge_time,r.delivery_tracking_error]).map_err(db_error)?;
         Ok(())
     }
     pub fn sync_sms(&self, records: &[SmsRecord], now: i64) -> Result<(), ModemError> {
@@ -413,7 +465,7 @@ impl Store {
         tx.execute("UPDATE sms SET present_on_modem=0,synchronized_at_ms=?1 WHERE source='sim' AND storage='SM'",[now]).map_err(db_error)?;
         for r in records {
             let indices = serde_json::to_string(&r.storage_indices).map_err(db_error)?;
-            tx.execute("INSERT INTO sms(id,direction,peer,body,state,message_reference,cause,created_at_ms,kind,source,storage,storage_index,modem_status,modem_timestamp,encoding,dcs,length,service_center,delivery_status,synchronized_at_ms,present_on_modem,fingerprint,storage_indices,part_count,parts_received,multipart_complete,superseded) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,1,?21,?22,?23,?24,?25,0) ON CONFLICT(storage,fingerprint) WHERE source='sim' DO UPDATE SET direction=excluded.direction,peer=excluded.peer,body=excluded.body,state=excluded.state,kind=excluded.kind,storage_index=excluded.storage_index,modem_status=excluded.modem_status,modem_timestamp=excluded.modem_timestamp,encoding=excluded.encoding,dcs=excluded.dcs,length=excluded.length,service_center=excluded.service_center,delivery_status=excluded.delivery_status,synchronized_at_ms=excluded.synchronized_at_ms,present_on_modem=1,storage_indices=excluded.storage_indices,part_count=excluded.part_count,parts_received=excluded.parts_received,multipart_complete=excluded.multipart_complete,superseded=0",params![r.id,r.direction,r.peer,r.body,r.state,r.message_reference,r.cause,r.created_at_ms,r.kind,r.source,r.storage,r.storage_index,r.modem_status,r.modem_timestamp,r.encoding,r.dcs,r.length,r.service_center,r.delivery_status,now,r.fingerprint,indices,r.part_count,r.parts_received,r.multipart_complete]).map_err(db_error)?;
+            tx.execute("INSERT INTO sms(id,direction,peer,body,state,message_reference,cause,created_at_ms,kind,source,storage,storage_index,modem_status,modem_timestamp,encoding,dcs,length,service_center,delivery_status,synchronized_at_ms,present_on_modem,fingerprint,storage_indices,part_count,parts_received,multipart_complete,superseded,delivery_report_scts,delivery_report_discharge_time) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,1,?21,?22,?23,?24,?25,0,?26,?27) ON CONFLICT(storage,fingerprint) WHERE source='sim' DO UPDATE SET direction=excluded.direction,peer=excluded.peer,body=excluded.body,state=excluded.state,kind=excluded.kind,storage_index=excluded.storage_index,modem_status=excluded.modem_status,modem_timestamp=excluded.modem_timestamp,encoding=excluded.encoding,dcs=excluded.dcs,length=excluded.length,service_center=excluded.service_center,delivery_status=excluded.delivery_status,synchronized_at_ms=excluded.synchronized_at_ms,present_on_modem=1,storage_indices=excluded.storage_indices,part_count=excluded.part_count,parts_received=excluded.parts_received,multipart_complete=excluded.multipart_complete,delivery_report_scts=excluded.delivery_report_scts,delivery_report_discharge_time=excluded.delivery_report_discharge_time,superseded=0",params![r.id,r.direction,r.peer,r.body,r.state,r.message_reference,r.cause,r.created_at_ms,r.kind,r.source,r.storage,r.storage_index,r.modem_status,r.modem_timestamp,r.encoding,r.dcs,r.length,r.service_center,r.delivery_status,now,r.fingerprint,indices,r.part_count,r.parts_received,r.multipart_complete,r.delivery_report_scts,r.delivery_report_discharge_time]).map_err(db_error)?;
             let logical_id: String = tx
                 .query_row(
                     "SELECT id FROM sms WHERE source='sim' AND storage=?1 AND fingerprint=?2",
@@ -435,13 +487,13 @@ impl Store {
             // unrelated messages created after SIM index reuse.
             reconcile_legacy_parts(&tx, r, &logical_id)?;
         }
-        apply_delivery_reports(&tx, records)?;
+        apply_delivery_reports(&tx, records, now)?;
         reconcile_stored_submissions(&tx, records)?;
         tx.commit().map_err(db_error)
     }
     pub fn list_sms(&self, limit: usize) -> Result<Vec<SmsRecord>, ModemError> {
         let c = self.connection()?;
-        let mut s=c.prepare("SELECT id,direction,peer,body,state,message_reference,cause,created_at_ms,kind,source,storage,storage_index,modem_status,modem_timestamp,encoding,dcs,length,service_center,delivery_status,synchronized_at_ms,present_on_modem,fingerprint,storage_indices,part_count,parts_received,multipart_complete FROM sms WHERE superseded=0 AND kind<>'status-report' ORDER BY created_at_ms DESC,storage_index DESC,id DESC LIMIT ?1").map_err(db_error)?;
+        let mut s=c.prepare("SELECT id,direction,peer,body,state,message_reference,cause,created_at_ms,kind,source,storage,storage_index,modem_status,modem_timestamp,encoding,dcs,length,service_center,delivery_status,synchronized_at_ms,present_on_modem,fingerprint,storage_indices,part_count,parts_received,multipart_complete,delivery_report_requested,delivery_report_scts,delivery_report_discharge_time,delivery_tracking_error FROM sms WHERE superseded=0 AND kind<>'status-report' ORDER BY created_at_ms DESC,storage_index DESC,id DESC LIMIT ?1").map_err(db_error)?;
         s.query_map([limit as i64], |r| {
             Ok(SmsRecord {
                 id: r.get(0)?,
@@ -470,6 +522,10 @@ impl Store {
                 part_count: r.get(23)?,
                 parts_received: r.get(24)?,
                 multipart_complete: r.get(25)?,
+                delivery_report_requested: r.get(26)?,
+                delivery_report_scts: r.get(27)?,
+                delivery_report_discharge_time: r.get(28)?,
+                delivery_tracking_error: r.get(29)?,
                 part_payloads: Vec::new(),
                 part_timestamps: Vec::new(),
             })
@@ -568,36 +624,78 @@ fn normalize_modem_timestamp(value: &str) -> &str {
 fn apply_delivery_reports(
     tx: &rusqlite::Transaction<'_>,
     records: &[SmsRecord],
-) -> Result<(), ModemError> {
+    synchronized_at_ms: i64,
+) -> Result<usize, ModemError> {
+    let mut matched_count = 0;
     for report in records.iter().filter(|record| {
         record.kind == "status-report"
             && !record.peer.is_empty()
             && !record.message_reference.is_empty()
     }) {
         let state = delivery_state(&report.delivery_status);
+        let scts_ms = modem_timestamp_ms(&report.delivery_report_scts);
+        let report_sync = if report.synchronized_at_ms == 0 {
+            synchronized_at_ms
+        } else {
+            report.synchronized_at_ms
+        };
+        let event_ms =
+            modem_timestamp_ms(&report.delivery_report_discharge_time).unwrap_or(report_sync);
+
+        // Once a report has been linked, an idempotent replay with the same
+        // SCTS follows that link even if TP-MR has since wrapped around.
+        let existing_link: Option<String> = tx
+            .query_row(
+                "SELECT matched_sms_id FROM sms WHERE kind='status-report' AND message_reference=?1 AND peer=?2 AND delivery_report_scts=?3 AND matched_sms_id<>'' LIMIT 1",
+                params![report.message_reference, report.peer, report.delivery_report_scts],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
         let mut statement = tx.prepare(
-            "SELECT id,peer FROM sms WHERE direction='outbound' AND message_reference=?1 AND kind<>'status-report' ORDER BY created_at_ms DESC,id DESC",
+            "SELECT id,peer,created_at_ms FROM sms WHERE source='app' AND direction='outbound' AND message_reference=?1 AND kind<>'status-report'",
         ).map_err(db_error)?;
         let candidates = statement
             .query_map([&report.message_reference], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
             })
             .map_err(db_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(db_error)?;
         drop(statement);
-        if let Some((id, _)) = candidates
+        let eligible = candidates
             .into_iter()
-            .find(|(_, peer)| normalize_peer(peer) == normalize_peer(&report.peer))
-        {
+            .filter(|(_, peer, created)| {
+                if normalize_peer(peer) != normalize_peer(&report.peer) {
+                    return false;
+                }
+                scts_ms.map_or_else(
+                    || *created <= report_sync,
+                    |scts| (*created - scts).abs() <= 600_000,
+                )
+            })
+            .collect::<Vec<_>>();
+        let matched =
+            existing_link.or_else(|| (eligible.len() == 1).then(|| eligible[0].0.clone()));
+        if let Some(id) = matched {
             tx.execute(
-                "UPDATE sms SET state=?1,delivery_status=?2 WHERE id=?3",
-                params![state, report.delivery_status, id],
+                "UPDATE sms SET state=?1,delivery_status=?2,delivery_report_scts=?3,delivery_report_discharge_time=?4,delivery_event_ms=?5 WHERE id=?6 AND (delivery_event_ms<?5 OR (delivery_event_ms=?5 AND state IN ('submitted','delivery-pending','delivery-unknown') AND ?1 IN ('delivered','delivery-failed')))",
+                params![state, report.delivery_status, report.delivery_report_scts, report.delivery_report_discharge_time, event_ms, id],
             )
             .map_err(db_error)?;
+            tx.execute(
+                "UPDATE sms SET matched_sms_id=?1 WHERE id=?2",
+                params![id, report.id],
+            )
+            .map_err(db_error)?;
+            matched_count += 1;
         }
     }
-    Ok(())
+    Ok(matched_count)
 }
 
 fn reconcile_stored_submissions(
@@ -649,11 +747,53 @@ fn delivery_state(status: &str) -> &'static str {
         .or_else(|| status.strip_prefix("0X"))
         .and_then(|value| u8::from_str_radix(value, 16).ok());
     match code {
-        Some(0x00..=0x1f) => "delivered",
+        Some(0x00) => "delivered",
+        Some(0x01..=0x1f) => "delivery-unknown",
         Some(0x20..=0x3f) => "delivery-pending",
-        Some(_) => "delivery-failed",
+        Some(0x40..=0x7f) => "delivery-failed",
+        Some(0x80..=0xff) => "delivery-unknown",
         None => "delivery-unknown",
     }
+}
+
+fn modem_timestamp_ms(value: &str) -> Option<i64> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 20
+        || bytes[2] != b'/'
+        || bytes[5] != b'/'
+        || bytes[8] != b','
+        || bytes[11] != b':'
+        || bytes[14] != b':'
+        || !matches!(bytes[17], b'+' | b'-')
+    {
+        return None;
+    }
+    let number = |start: usize| {
+        std::str::from_utf8(&bytes[start..start + 2])
+            .ok()?
+            .parse::<i64>()
+            .ok()
+    };
+    let (year, month, day) = (2000 + number(0)?, number(3)?, number(6)?);
+    let (hour, minute, second, quarters) = (number(9)?, number(12)?, number(15)?, number(18)?);
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+        || quarters > 79
+    {
+        return None;
+    }
+    let adjusted_year = year - i64::from(month <= 2);
+    let era = adjusted_year.div_euclid(400);
+    let yoe = adjusted_year - era * 400;
+    let shifted_month = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * shifted_month + 2) / 5 + day - 1;
+    let days = era * 146097 + (yoe * 365 + yoe / 4 - yoe / 100) + doy - 719468;
+    let seconds = days * 86400 + hour * 3600 + minute * 60 + second;
+    let offset = quarters * 900 * if bytes[17] == b'-' { -1 } else { 1 };
+    Some((seconds - offset) * 1000)
 }
 fn sms_dcs_uses_ucs2(dcs: u8) -> bool {
     (dcs & 0xc0 == 0 && dcs & 0x0c == 8) || dcs & 0xf0 == 0xe0
@@ -693,7 +833,7 @@ mod tests {
     #[test]
     fn migrates_and_round_trips_settings() {
         let store = Store::memory().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 7);
+        assert_eq!(store.schema_version().unwrap(), 8);
         let mut expected = Settings::default();
         expected.port_override = Some("COM6".into());
         store.save_settings(&expected, 42).unwrap();
@@ -1001,8 +1141,101 @@ mod tests {
 
     #[test]
     fn permanent_status_report_is_delivery_failure() {
+        assert_eq!(delivery_state("0x00"), "delivered");
+        assert_eq!(delivery_state("0x01"), "delivery-unknown");
+        assert_eq!(delivery_state("0x1F"), "delivery-unknown");
+        assert_eq!(delivery_state("0x20"), "delivery-pending");
+        assert_eq!(delivery_state("0x3F"), "delivery-pending");
         assert_eq!(delivery_state("0x40"), "delivery-failed");
+        assert_eq!(delivery_state("0x7F"), "delivery-failed");
+        assert_eq!(delivery_state("0x80"), "delivery-unknown");
+        assert_eq!(delivery_state("0xFF"), "delivery-unknown");
         assert_eq!(delivery_state("malformed"), "delivery-unknown");
+    }
+
+    #[test]
+    fn pending_delivery_expires_but_late_terminal_report_wins() {
+        let store = Store::memory().unwrap();
+        store
+            .save_sms(&SmsRecord {
+                id: "sent".into(),
+                direction: "outbound".into(),
+                peer: "+66812345678".into(),
+                message_reference: "42".into(),
+                state: "delivery-pending".into(),
+                kind: "submitted".into(),
+                source: "app".into(),
+                created_at_ms: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(store.expire_delivery_reports(86_400_001).unwrap(), 1);
+        assert_eq!(store.list_sms(1).unwrap()[0].state, "delivery-unknown");
+        store
+            .apply_direct_delivery_report(
+                &SmsRecord {
+                    id: "late".into(),
+                    direction: "inbound".into(),
+                    peer: "+66812345678".into(),
+                    message_reference: "42".into(),
+                    kind: "status-report".into(),
+                    delivery_status: "0x00".into(),
+                    synchronized_at_ms: 86_400_002,
+                    ..Default::default()
+                },
+                86_400_002,
+            )
+            .unwrap();
+        assert_eq!(store.list_sms(1).unwrap()[0].state, "delivered");
+    }
+
+    #[test]
+    fn ambiguous_reused_message_reference_is_not_correlated() {
+        let store = Store::memory().unwrap();
+        for (id, created_at_ms) in [("first", 1_000), ("second", 2_000)] {
+            store
+                .save_sms(&SmsRecord {
+                    id: id.into(),
+                    direction: "outbound".into(),
+                    peer: "+66812345678".into(),
+                    message_reference: "7".into(),
+                    state: "submitted".into(),
+                    kind: "submitted".into(),
+                    source: "app".into(),
+                    created_at_ms,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        store
+            .sync_sms(
+                &[SmsRecord {
+                    id: "report".into(),
+                    direction: "inbound".into(),
+                    peer: "+66812345678".into(),
+                    message_reference: "7".into(),
+                    kind: "status-report".into(),
+                    source: "sim".into(),
+                    storage: "SM".into(),
+                    storage_index: 8,
+                    storage_indices: vec![8],
+                    delivery_status: "0x00".into(),
+                    fingerprint: "report".into(),
+                    part_count: 1,
+                    parts_received: 1,
+                    multipart_complete: true,
+                    ..Default::default()
+                }],
+                3_000,
+            )
+            .unwrap();
+        assert!(
+            store
+                .list_sms(10)
+                .unwrap()
+                .iter()
+                .all(|sms| sms.state == "submitted")
+        );
     }
 
     #[test]

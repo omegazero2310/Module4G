@@ -48,3 +48,14 @@ depend on a prebuilt `target/release/modemd.exe`.
 Physical acceptance is intentionally pending. With hardware, record actual composite COM
 interfaces and raw prompt bytes; confirm VID/PID and baud; tune upload pacing; then exercise SMS
 send/receive/delivery, USSD, answered and failed calls, remote audio, USB removal, and reconnect.
+
+For SMS delivery-report acceptance, record the A7670 model, COM port, `ATI`, `AT+CGMR`,
+`AT+CNMI=?`, `AT+CNMI?`, `AT+CSMP?`, and `AT+CPMS?`. Test reachable and unreachable recipients,
+daemon restart and application closure before the receipt, a receipt arriving during a call, and
+TP-MR reuse. A missing carrier receipt is not a delivery failure. When delivery tracking was
+verified, a submitted message remains Delivery pending for the `AT+CSMP=49,167,0,0` 24-hour
+validity period, then becomes Delivery unknown if no terminal report arrives. A late terminal
+report must still replace Delivery unknown. Confirm that an airplane-mode recipient releases Send
+as soon as `+CMGS` and `OK` arrive; submission must never wait for handset delivery. If the modem
+provides no final submission result within 40 seconds, the operation must finish as Send result
+unknown.
