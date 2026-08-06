@@ -7,8 +7,9 @@ pub mod host {
     use modemd::{
         call_workflow::CallManager,
         hardware::{self, PayloadMode},
+        integration::{self, CommunicationDispatcher, DispatchError, RestState},
         settings::Settings,
-        storage::{BalanceRecord, SmsRecord, Store},
+        storage::{BalanceRecord, IntegrationSettings, SmsRecord, Store},
     };
     use routing::*;
     use sms_workflow::*;
@@ -66,6 +67,7 @@ pub mod host {
         command_tx: mpsc::Sender<hardware::AtRequest>,
         store: Arc<Store>,
         call_manager: Arc<CallManager>,
+        integration_settings: Arc<RwLock<IntegrationSettings>>,
     }
 
     define_windows_service!(ffi_service_main, service_main);
@@ -168,6 +170,11 @@ pub mod host {
         let settings = Arc::new(RwLock::new(
             store.load_settings().map_err(io::Error::other)?,
         ));
+        let integration_settings = Arc::new(RwLock::new(
+            store
+                .load_integration_settings()
+                .map_err(io::Error::other)?,
+        ));
         let device_state = Arc::new(RwLock::new(hardware::HardwareState::Disconnected));
         let delivery_capability = Arc::new(RwLock::new(DeliveryCapability::default()));
         let delivery_configuration = Arc::new(tokio::sync::Mutex::new(()));
@@ -218,7 +225,45 @@ pub mod host {
             command_tx: command_tx.clone(),
             store: Arc::clone(&store),
             call_manager: Arc::clone(&call_manager),
+            integration_settings: Arc::clone(&integration_settings),
         });
+        let rest_dispatcher: Arc<dyn CommunicationDispatcher> = Arc::new(HostDispatcher {
+            command_tx: command_tx.clone(),
+            store: Arc::clone(&store),
+            call_manager: Arc::clone(&call_manager),
+            delivery_capability: Arc::clone(&delivery_capability),
+            delivery_configuration: Arc::clone(&delivery_configuration),
+        });
+        let rest_state = RestState {
+            store: Arc::clone(&store),
+            settings: Arc::clone(&integration_settings),
+            dispatcher: rest_dispatcher,
+        };
+        let bind_address = integration_settings
+            .read()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .rest_bind_address
+            .clone();
+        let rest_listener = tokio::spawn(async move {
+            loop {
+                match tokio::net::TcpListener::bind(&bind_address).await {
+                    Ok(listener) => {
+                        eprintln!("REST integration listener bound on {bind_address}");
+                        if let Err(error) = integration::serve(listener, rest_state.clone()).await {
+                            eprintln!("REST integration listener stopped: {error}");
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("REST integration bind deferred on {bind_address}: {error}")
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+        let webhook_worker = tokio::spawn(integration::deliver_webhooks(
+            Arc::clone(&store),
+            Arc::clone(&integration_settings),
+        ));
         let sync_tx = command_tx.clone();
         let sync_store = Arc::clone(&store);
         let sync_calls = Arc::clone(&call_manager);
@@ -319,6 +364,8 @@ pub mod host {
             tokio::select! {
                 _ = &mut stop => {
                     sms_synchronizer.abort();
+                    rest_listener.abort();
+                    webhook_worker.abort();
                     monitor_stop.store(true, Ordering::Relaxed);
                     monitor.await.map_err(io::Error::other)?;
                     return Ok(());
@@ -328,6 +375,63 @@ pub mod host {
                     tokio::spawn(handle_client(server, Arc::clone(&context)));
                 }
             }
+        }
+    }
+
+    struct HostDispatcher {
+        command_tx: mpsc::Sender<hardware::AtRequest>,
+        store: Arc<Store>,
+        call_manager: Arc<CallManager>,
+        delivery_capability: Arc<RwLock<DeliveryCapability>>,
+        delivery_configuration: Arc<tokio::sync::Mutex<()>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CommunicationDispatcher for HostDispatcher {
+        async fn send_sms(
+            &self,
+            id: String,
+            destination: String,
+            body: String,
+        ) -> Result<(), DispatchError> {
+            let value = serde_json::json!({"destination":destination,"body":body});
+            send_sms_with_id(
+                id,
+                value,
+                &self.command_tx,
+                &self.store,
+                &self.delivery_capability,
+                &self.delivery_configuration,
+            )
+            .await
+            // The SMS workflow persists both confirmed rejection and unknown
+            // submission outcomes. Reconciliation maps that durable state.
+            .map(|_| ())
+            .or(Ok(()))
+        }
+        async fn make_call(
+            &self,
+            id: String,
+            destination: String,
+            audio_id: String,
+        ) -> Result<(), DispatchError> {
+            self.call_manager
+                .select_audio(&audio_id)
+                .map_err(|error| match error {
+                    modemd::ModemError::Validation(message) => DispatchError::Validation(message),
+                    _ => DispatchError::Unavailable(error.to_string()),
+                })?;
+            self.call_manager
+                .make_call_with_id(id, destination, audio_id)
+                .await
+                .map(|_| ())
+                .map_err(|error| match error {
+                    modemd::ModemError::Validation(message) => DispatchError::Validation(message),
+                    modemd::ModemError::Busy | modemd::ModemError::Disconnected => {
+                        DispatchError::Unavailable(error.to_string())
+                    }
+                    _ => DispatchError::Failed(error.to_string()),
+                })
         }
     }
 

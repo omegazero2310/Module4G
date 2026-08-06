@@ -178,6 +178,16 @@ impl CallManager {
         destination: String,
         audio_id: String,
     ) -> Result<CallRecord, ModemError> {
+        self.make_call_with_id(ulid::Ulid::new().to_string(), destination, audio_id)
+            .await
+    }
+
+    pub async fn make_call_with_id(
+        self: &Arc<Self>,
+        id: String,
+        destination: String,
+        audio_id: String,
+    ) -> Result<CallRecord, ModemError> {
         if self.uploading.load(Ordering::Acquire) {
             return Err(ModemError::Busy);
         }
@@ -192,7 +202,7 @@ impl CallManager {
             ));
         }
         let record = CallRecord {
-            id: ulid::Ulid::new().to_string(),
+            id,
             peer: destination,
             state: "waiting-for-answer".into(),
             audio_id,

@@ -6,6 +6,7 @@ mod balance_handlers;
 mod call_handlers;
 mod client;
 mod console;
+mod integration_handlers;
 mod logging;
 mod models;
 mod settings_handlers;
@@ -89,6 +90,8 @@ pub fn run() {
             settings_handlers::get_settings,
             settings_handlers::update_settings,
             settings_handlers::list_ports,
+            integration_handlers::get_integration_settings,
+            integration_handlers::update_integration_settings,
             console::execute_at,
             sms_handlers::send_sms,
             sms_handlers::sync_sms,

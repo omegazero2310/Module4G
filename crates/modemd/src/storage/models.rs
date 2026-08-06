@@ -79,3 +79,60 @@ pub struct CallRecord {
     pub ended_at_ms: i64,
     pub release_cause: String,
 }
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct IntegrationSettings {
+    pub rest_enabled: bool,
+    pub rest_bind_address: String,
+    pub webhook_url: String,
+    pub rest_token: String,
+    pub webhook_token: String,
+}
+
+impl Default for IntegrationSettings {
+    fn default() -> Self {
+        Self {
+            rest_enabled: false,
+            rest_bind_address: "0.0.0.0:5069".into(),
+            webhook_url: "http://10.1.11.117:5068/api/v1/webhooks/receive".into(),
+            rest_token: String::new(),
+            webhook_token: String::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RestCommunication {
+    pub id: String,
+    pub record_id: String,
+    pub channel: String,
+    pub owner: String,
+    pub destination: String,
+    pub content: String,
+    pub encrypted: bool,
+    pub payload_fingerprint: String,
+    pub status: String,
+    pub created_at_ms: i64,
+    pub sent_at_ms: i64,
+    pub delivered_at_ms: i64,
+    pub failed_at_ms: i64,
+    pub failure_reason: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WebhookAttempt {
+    pub id: i64,
+    pub communication_id: String,
+    pub event_type: String,
+    pub payload: String,
+    pub attempt_count: u32,
+    pub next_attempt_at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommunicationReservation {
+    New(RestCommunication),
+    Replay(RestCommunication),
+    Conflict,
+}

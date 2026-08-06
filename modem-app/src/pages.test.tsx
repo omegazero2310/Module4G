@@ -69,8 +69,17 @@ describe("Settings page", () => {
       lowBalanceThreshold: 10000,
       balanceRegex: "balance",
     };
-    invokeMock.mockImplementation((command: string, args?: { settings: Settings }) =>
-      command === "get_settings" ? Promise.resolve(settings) : Promise.resolve(args?.settings));
+    const integration = {
+      restEnabled: false, restBindAddress: "0.0.0.0:5069",
+      webhookUrl: "http://10.1.11.117:5068/api/v1/webhooks/receive",
+      hasRestToken: false, hasWebhookToken: false, restToken: "", webhookToken: "",
+      clearRestToken: false, clearWebhookToken: false,
+    };
+    invokeMock.mockImplementation((command: string, args?: { settings: Settings }) => {
+      if (command === "get_settings") return Promise.resolve(settings);
+      if (command === "get_integration_settings") return Promise.resolve(integration);
+      return Promise.resolve(args?.settings);
+    });
     render(<SettingsPage/>);
     const override = await screen.findByLabelText("Port override");
     await userEvent.type(override, "COM9");

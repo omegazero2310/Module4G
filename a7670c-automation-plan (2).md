@@ -16,6 +16,13 @@ Manual verified against: `A76XX-Series_AT_Command_Manual_V1_06-4.pdf`
 
 **Why split daemon/app:** the modem is a single half-duplex AT command channel — only one process can own the serial port. The daemon is the sole owner; it serializes commands (queue, one in-flight at a time, matched to response/URC), and multiple UIs can attach as clients without contention. The daemon can run headless (systemd service, Windows service, Docker container) independent of whatever UI is used.
 
+**LAN integration:** `modemd` also provides an optional authenticated HTTP adapter for immediate
+SMS and call requests. It invokes the same serialized daemon workflows and never opens the serial
+port independently. REST UUIDs, normalized lifecycle state, and an ordered webhook retry outbox are
+persisted in SQLite. Only REST-created outbound communications emit webhooks. The adapter is disabled
+until a bearer token is stored; plain HTTP deployments must remain on a firewall-restricted trusted
+LAN because bearer tokens and communication content are not encrypted in transit.
+
 ## 2. Language choice
 
 **Daemon: Rust.**

@@ -35,6 +35,23 @@ The daemon treats modem SMS storage as a durable inbox queue. Synchronization co
 message and status report to SQLite before deleting those exact modem slots. This keeps a full `SM`
 store from blocking inbound SMS or stored delivery reports while preserving the application archive.
 
+## REST and webhook integration
+
+The Windows service can expose `POST /api/v1/communications` on the configurable REST listener
+(default `0.0.0.0:5069`). REST is disabled by default and cannot be enabled until a bearer token has
+been stored on the Settings page. Requests support `sms` and `call` channels, UUID idempotency, and
+immediate work only; call content is the case-insensitive name of an uploaded AMR-NB file.
+
+Only REST-created communications produce lifecycle webhooks. Delivery uses a durable SQLite outbox,
+preserves event order for each communication, disables redirects, and retries until a 2xx response.
+The default receiver is `http://10.1.11.117:5068/api/v1/webhooks/receive`; its bearer token is
+configured separately and is never returned to the UI.
+
+This interface is intended only for a firewall-restricted, trusted LAN. Plain HTTP does not encrypt
+REST or webhook bearer tokens, phone numbers, or content in transit. Use network isolation or a TLS
+terminating reverse proxy when the LAN cannot be fully trusted. Changing the bind address requires a
+service restart; enablement, webhook URL, and token changes apply immediately.
+
 ## Current implementation status
 
 Implemented: protobuf surface, byte-oriented framing including bare prompts, SMS/number limits,

@@ -10,6 +10,7 @@ pub(super) async fn handle_client(
     let command_tx = context.command_tx.clone();
     let store = Arc::clone(&context.store);
     let call_manager = Arc::clone(&context.call_manager);
+    let integration_settings = Arc::clone(&context.integration_settings);
     let mut stream = BufReader::new(server);
     let mut line = String::new();
     while stream.read_line(&mut line).await? != 0 {
@@ -22,6 +23,7 @@ pub(super) async fn handle_client(
                 &call_manager,
                 &delivery_capability,
                 &delivery_configuration,
+                &integration_settings,
             )
             .await
         } else if request == "STATUS" {
@@ -125,6 +127,7 @@ pub(super) async fn handle_json(
     call_manager: &Arc<CallManager>,
     delivery_capability: &Arc<RwLock<DeliveryCapability>>,
     delivery_configuration: &Arc<tokio::sync::Mutex<()>>,
+    integration_settings: &Arc<RwLock<IntegrationSettings>>,
 ) -> String {
     let value: serde_json::Value = match serde_json::from_str(request) {
         Ok(v) => v,
@@ -227,12 +230,108 @@ pub(super) async fn handle_json(
                 .map_err(|error| error.to_string())
         })
         .map(|settings| serde_json::to_value(settings).unwrap()),
+        "get_integration_settings" => Ok(serde_json::to_value(
+            modemd::integration::PublicIntegrationSettings::from(
+                &*integration_settings
+                    .read()
+                    .unwrap_or_else(|lock| lock.into_inner()),
+            ),
+        )
+        .unwrap()),
+        "update_integration_settings" => {
+            update_integration_settings(&value, store, integration_settings)
+                .map(|settings| serde_json::to_value(settings).unwrap())
+        }
+        "replace_rest_token" => {
+            replace_integration_token(&value, store, integration_settings, true, false)
+                .map(|settings| serde_json::to_value(settings).unwrap())
+        }
+        "clear_rest_token" => {
+            replace_integration_token(&value, store, integration_settings, true, true)
+                .map(|settings| serde_json::to_value(settings).unwrap())
+        }
+        "replace_webhook_token" => {
+            replace_integration_token(&value, store, integration_settings, false, false)
+                .map(|settings| serde_json::to_value(settings).unwrap())
+        }
+        "clear_webhook_token" => {
+            replace_integration_token(&value, store, integration_settings, false, true)
+                .map(|settings| serde_json::to_value(settings).unwrap())
+        }
         _ => Err("unknown JSON command".into()),
     };
     match result {
         Ok(data) => serde_json::json!({"ok":true,"data":data}).to_string() + "\n",
         Err(error) => serde_json::json!({"ok":false,"error":error}).to_string() + "\n",
     }
+}
+
+fn update_integration_settings(
+    value: &serde_json::Value,
+    store: &Store,
+    current: &Arc<RwLock<IntegrationSettings>>,
+) -> Result<modemd::integration::PublicIntegrationSettings, String> {
+    let requested: value::Public =
+        serde_json::from_value(value.get("settings").cloned().unwrap_or_default())
+            .map_err(|_| "invalid integration settings payload".to_owned())?;
+    let mut settings = current
+        .read()
+        .unwrap_or_else(|lock| lock.into_inner())
+        .clone();
+    settings.rest_enabled = requested.rest_enabled;
+    settings.rest_bind_address = requested.rest_bind_address;
+    settings.webhook_url = requested.webhook_url;
+    store
+        .save_integration_settings(&settings, now())
+        .map_err(|e| e.to_string())?;
+    *current.write().unwrap_or_else(|lock| lock.into_inner()) = settings.clone();
+    Ok((&settings).into())
+}
+
+mod value {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct Public {
+        pub rest_enabled: bool,
+        pub rest_bind_address: String,
+        pub webhook_url: String,
+    }
+}
+
+fn replace_integration_token(
+    value: &serde_json::Value,
+    store: &Store,
+    current: &Arc<RwLock<IntegrationSettings>>,
+    rest: bool,
+    clear: bool,
+) -> Result<modemd::integration::PublicIntegrationSettings, String> {
+    let mut settings = current
+        .read()
+        .unwrap_or_else(|lock| lock.into_inner())
+        .clone();
+    let token = if clear {
+        String::new()
+    } else {
+        value
+            .get("token")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
+    };
+    if !clear && token.is_empty() {
+        return Err("token must not be empty".into());
+    }
+    if rest {
+        settings.rest_token = token
+    } else {
+        settings.webhook_token = token
+    }
+    store
+        .save_integration_settings(&settings, now())
+        .map_err(|e| e.to_string())?;
+    *current.write().unwrap_or_else(|lock| lock.into_inner()) = settings.clone();
+    Ok((&settings).into())
 }
 pub(super) fn json_error(e: impl std::fmt::Display) -> String {
     serde_json::json!({"ok":false,"error":e.to_string()}).to_string() + "\n"
@@ -294,6 +393,25 @@ pub(super) async fn send_sms_json(
     delivery_capability: &Arc<RwLock<DeliveryCapability>>,
     delivery_configuration: &Arc<tokio::sync::Mutex<()>>,
 ) -> Result<SmsRecord, String> {
+    send_sms_with_id(
+        ulid::Ulid::new().to_string(),
+        v,
+        tx,
+        store,
+        delivery_capability,
+        delivery_configuration,
+    )
+    .await
+}
+
+pub(super) async fn send_sms_with_id(
+    id: String,
+    v: serde_json::Value,
+    tx: &mpsc::Sender<hardware::AtRequest>,
+    store: &Store,
+    delivery_capability: &Arc<RwLock<DeliveryCapability>>,
+    delivery_configuration: &Arc<tokio::sync::Mutex<()>>,
+) -> Result<SmsRecord, String> {
     let peer = modemd::sms::normalize_sms_destination(
         v.get("destination")
             .and_then(|x| x.as_str())
@@ -307,7 +425,7 @@ pub(super) async fn send_sms_json(
         .to_owned();
     modemd::sms::validate_body(&body).map_err(|e| e.to_string())?;
     let mut record = SmsRecord {
-        id: ulid::Ulid::new().to_string(),
+        id,
         direction: "outbound".into(),
         peer: peer.clone(),
         body: body.clone(),

@@ -8,9 +8,13 @@ use delivery::*;
 mod audio;
 mod balance;
 mod calls;
+mod integration;
 mod schema;
 mod sms;
-pub use models::{BalanceRecord, CallRecord, SmsRecord, UploadedAudioRecord};
+pub use models::{
+    BalanceRecord, CallRecord, CommunicationReservation, IntegrationSettings, RestCommunication,
+    SmsRecord, UploadedAudioRecord, WebhookAttempt,
+};
 
 pub struct Store(Mutex<Connection>);
 
@@ -93,7 +97,7 @@ mod tests {
     #[test]
     fn migrates_and_round_trips_settings() {
         let store = Store::memory().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 8);
+        assert_eq!(store.schema_version().unwrap(), 9);
         let mut expected = Settings::default();
         expected.port_override = Some("COM6".into());
         store.save_settings(&expected, 42).unwrap();

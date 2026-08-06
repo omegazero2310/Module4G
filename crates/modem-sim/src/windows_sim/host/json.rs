@@ -17,6 +17,33 @@ pub(super) fn json_response(request: &str, state: &mut SimState) -> Option<Strin
             state.settings = Some(settings.clone());
             serde_json::json!({"ok":true,"data":settings})
         }
+        "get_integration_settings" => {
+            serde_json::json!({"ok":true,"data":state.integration_settings.clone().unwrap_or_else(||serde_json::json!({
+                "restEnabled":false,"restBindAddress":"0.0.0.0:5069","webhookUrl":"http://10.1.11.117:5068/api/v1/webhooks/receive","hasRestToken":false,"hasWebhookToken":false
+            }))})
+        }
+        "update_integration_settings" => {
+            let mut settings = value.get("settings").cloned().unwrap_or_default();
+            let old = state.integration_settings.clone().unwrap_or_default();
+            settings["hasRestToken"] = old.get("hasRestToken").cloned().unwrap_or(false.into());
+            settings["hasWebhookToken"] =
+                old.get("hasWebhookToken").cloned().unwrap_or(false.into());
+            state.integration_settings = Some(settings.clone());
+            serde_json::json!({"ok":true,"data":settings})
+        }
+        "replace_rest_token"
+        | "clear_rest_token"
+        | "replace_webhook_token"
+        | "clear_webhook_token" => {
+            let mut settings=state.integration_settings.clone().unwrap_or_else(||serde_json::json!({"restEnabled":false,"restBindAddress":"0.0.0.0:5069","webhookUrl":"http://10.1.11.117:5068/api/v1/webhooks/receive"}));
+            if command.contains("rest_token") {
+                settings["hasRestToken"] = (command == "replace_rest_token").into();
+            } else {
+                settings["hasWebhookToken"] = (command == "replace_webhook_token").into();
+            }
+            state.integration_settings = Some(settings.clone());
+            serde_json::json!({"ok":true,"data":settings})
+        }
         "get_current_audio" => serde_json::json!({"ok":true,"data":state.current_audio}),
         "list_audio" => serde_json::json!({"ok":true,"data":state.audio}),
         "get_call_data" => {

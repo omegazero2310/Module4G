@@ -42,6 +42,40 @@ pub(super) struct Settings {
     pub(super) balance_regex: String,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct IntegrationSettings {
+    pub(super) rest_enabled: bool,
+    pub(super) rest_bind_address: String,
+    pub(super) webhook_url: String,
+    pub(super) has_rest_token: bool,
+    pub(super) has_webhook_token: bool,
+    #[serde(default)]
+    pub(super) rest_token: String,
+    #[serde(default)]
+    pub(super) webhook_token: String,
+    #[serde(default)]
+    pub(super) clear_rest_token: bool,
+    #[serde(default)]
+    pub(super) clear_webhook_token: bool,
+}
+
+impl Default for IntegrationSettings {
+    fn default() -> Self {
+        Self {
+            rest_enabled: false,
+            rest_bind_address: "0.0.0.0:5069".into(),
+            webhook_url: "http://10.1.11.117:5068/api/v1/webhooks/receive".into(),
+            has_rest_token: false,
+            has_webhook_token: false,
+            rest_token: String::new(),
+            webhook_token: String::new(),
+            clear_rest_token: false,
+            clear_webhook_token: false,
+        }
+    }
+}
+
 impl From<CoreSettings> for Settings {
     fn from(value: CoreSettings) -> Self {
         Self {

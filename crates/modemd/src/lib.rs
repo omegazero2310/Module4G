@@ -5,6 +5,7 @@ pub mod audio;
 pub mod call;
 pub mod call_workflow;
 pub mod hardware;
+pub mod integration;
 pub mod settings;
 pub mod sms;
 pub mod storage;

@@ -146,6 +146,22 @@ impl Store {
                 [],
             )
             .map_err(db_error)?;
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS integration_settings(id INTEGER PRIMARY KEY CHECK(id=1),json TEXT NOT NULL,updated_at_ms INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS rest_communications(
+               id TEXT PRIMARY KEY,record_id TEXT NOT NULL UNIQUE,channel TEXT NOT NULL,owner TEXT NOT NULL,
+               destination TEXT NOT NULL,content TEXT NOT NULL,encrypted INTEGER NOT NULL,
+               payload_fingerprint TEXT NOT NULL,status TEXT NOT NULL,created_at_ms INTEGER NOT NULL,
+               sent_at_ms INTEGER,delivered_at_ms INTEGER,failed_at_ms INTEGER,failure_reason TEXT NOT NULL DEFAULT '');
+             CREATE TABLE IF NOT EXISTS webhook_outbox(
+               id INTEGER PRIMARY KEY AUTOINCREMENT,communication_id TEXT NOT NULL,event_type TEXT NOT NULL,
+               payload TEXT NOT NULL,attempt_count INTEGER NOT NULL DEFAULT 0,next_attempt_at_ms INTEGER NOT NULL,
+               last_error TEXT NOT NULL DEFAULT '',completed_at_ms INTEGER,
+               UNIQUE(communication_id,event_type),
+               FOREIGN KEY(communication_id) REFERENCES rest_communications(id));
+             CREATE INDEX IF NOT EXISTS webhook_outbox_due ON webhook_outbox(completed_at_ms,next_attempt_at_ms,id);
+             INSERT OR IGNORE INTO schema_migrations(version) VALUES (9);",
+        ).map_err(db_error)?;
         Ok(())
     }
 }

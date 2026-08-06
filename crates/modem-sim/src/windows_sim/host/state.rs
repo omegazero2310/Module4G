@@ -19,6 +19,7 @@ pub(super) struct SimState {
     pub(super) call_scenario: String,
     pub(super) polls: u32,
     pub(super) settings: Option<serde_json::Value>,
+    pub(super) integration_settings: Option<serde_json::Value>,
     pub(super) hang_attempts: u32,
     pub(super) sms: Vec<serde_json::Value>,
     pub(super) sms_polls: u32,
