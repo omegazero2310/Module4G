@@ -82,6 +82,10 @@ describe("Settings page", () => {
     });
     render(<SettingsPage/>);
     const override = await screen.findByLabelText("Port override");
+    const restToken = screen.getByLabelText("Replace REST bearer token") as HTMLInputElement;
+    await userEvent.click(screen.getByRole("button", { name: "Generate token" }));
+    expect(restToken.value).toMatch(/^[0-9a-f]{64}$/);
+    expect(screen.getByLabelText("Clear stored REST token")).not.toBeChecked();
     await userEvent.type(override, "COM9");
     await userEvent.click(screen.getByRole("button", { name: "Save settings" }));
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("update_settings", {
