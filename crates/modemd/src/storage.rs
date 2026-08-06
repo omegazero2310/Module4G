@@ -508,7 +508,7 @@ impl Store {
     pub fn list_sms(&self, limit: usize) -> Result<Vec<SmsRecord>, ModemError> {
         let c = self.connection()?;
         let mut s=c.prepare("SELECT id,direction,peer,body,state,message_reference,cause,created_at_ms,kind,source,storage,storage_index,modem_status,modem_timestamp,encoding,dcs,length,service_center,delivery_status,synchronized_at_ms,present_on_modem,fingerprint,storage_indices,part_count,parts_received,multipart_complete,delivery_report_requested,delivery_report_scts,delivery_report_discharge_time,delivery_tracking_error FROM sms WHERE superseded=0 AND kind<>'status-report' ORDER BY created_at_ms DESC,storage_index DESC,id DESC LIMIT ?1").map_err(db_error)?;
-        s.query_map([limit as i64], |r| {
+        s.query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |r| {
             Ok(SmsRecord {
                 id: r.get(0)?,
                 direction: r.get(1)?,

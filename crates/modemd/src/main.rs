@@ -893,7 +893,7 @@ mod windows_host {
         let stamp = now();
         let records = snapshot_records(modemd::sms::parse_cmgl(&lines), stamp);
         store.sync_sms(&records, stamp).map_err(|e| e.to_string())?;
-        archive_modem_sms(tx, store, &records).await?;
+        archive_modem_sms(tx, store, &records, stamp).await?;
         Ok(records.len())
     }
 
@@ -901,23 +901,38 @@ mod windows_host {
         tx: &mpsc::Sender<hardware::AtRequest>,
         store: &Store,
         records: &[SmsRecord],
+        now_ms: i64,
     ) -> Result<(), String> {
-        let commands = archive_commands(records);
+        let archived_records = records
+            .iter()
+            .filter(|record| sms_ready_for_archive(record, now_ms))
+            .cloned()
+            .collect::<Vec<_>>();
+        let commands = archive_commands(&archived_records, now_ms);
         if commands.is_empty() {
             return Ok(());
         }
         let count = commands.len();
         actor_batch_lines(tx, commands, None, Duration::from_secs(90)).await?;
         store
-            .mark_sms_archived(records)
+            .mark_sms_archived(&archived_records)
             .map_err(|error| error.to_string())?;
         eprintln!("archived {count} modem SMS storage slots after durable synchronization");
         Ok(())
     }
 
-    fn archive_commands(records: &[SmsRecord]) -> Vec<String> {
+    const MULTIPART_ARCHIVE_GRACE_MS: i64 = 5 * 60 * 1000;
+
+    fn sms_ready_for_archive(record: &SmsRecord, now_ms: i64) -> bool {
+        record.part_count <= 1
+            || record.multipart_complete
+            || now_ms.saturating_sub(record.created_at_ms) >= MULTIPART_ARCHIVE_GRACE_MS
+    }
+
+    fn archive_commands(records: &[SmsRecord], now_ms: i64) -> Vec<String> {
         let mut indices = records
             .iter()
+            .filter(|record| sms_ready_for_archive(record, now_ms))
             .flat_map(|record| record.storage_indices.iter().copied())
             .filter(|index| *index > 0)
             .collect::<Vec<_>>();
@@ -1160,8 +1175,12 @@ mod windows_host {
         use std::collections::HashSet;
         let baseline = actor_pdu_snapshot(command_tx).await?;
         let baseline_records = snapshot_records(modemd::sms::parse_cmgl(&baseline), now());
-        let identities: HashSet<String> = baseline_records
+        let persisted_baseline = store
+            .list_sms(usize::MAX)
+            .map_err(|error| error.to_string())?;
+        let identities: HashSet<String> = persisted_baseline
             .iter()
+            .chain(&baseline_records)
             .map(|record| record.fingerprint.clone())
             .collect();
 
@@ -1177,33 +1196,46 @@ mod windows_host {
                 Ok(lines) => {
                     let stamp = now();
                     let records = snapshot_records(modemd::sms::parse_cmgl(&lines), stamp);
-                    if let Some(message) = records.iter().find(|record| {
-                        !identities.contains(&record.fingerprint)
-                            && record.peer == "191"
-                            && record.multipart_complete
-                            && is_viettel_balance_body(&record.body)
-                    }) {
+                    if find_balance_candidate(&records, &identities).is_some() {
                         store
                             .sync_sms(&records, stamp)
                             .map_err(|error| error.to_string())?;
-                        let canonical = store
-                            .list_sms(1000)
-                            .map_err(|error| error.to_string())?
-                            .into_iter()
-                            .find(|record| {
-                                record.source == "sim" && record.fingerprint == message.fingerprint
-                            })
-                            .ok_or_else(|| {
-                                "balance SMS was synchronized but could not be linked".to_owned()
-                            })?;
-                        return Ok((message.body.clone(), canonical.id));
                     }
                 }
                 Err(error) => return Err(error),
             }
+            if let Some(message) = find_persisted_balance_candidate(store, &identities)? {
+                return Ok((message.body, message.id));
+            }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
+        if let Some(message) = find_persisted_balance_candidate(store, &identities)? {
+            return Ok((message.body, message.id));
+        }
         Err("timed out waiting for a new complete Viettel balance SMS from 191".into())
+    }
+
+    fn find_persisted_balance_candidate(
+        store: &Store,
+        baseline: &std::collections::HashSet<String>,
+    ) -> Result<Option<SmsRecord>, String> {
+        let records = store
+            .list_sms(usize::MAX)
+            .map_err(|error| error.to_string())?;
+        Ok(find_balance_candidate(&records, baseline).cloned())
+    }
+
+    fn find_balance_candidate<'a>(
+        records: &'a [SmsRecord],
+        baseline: &std::collections::HashSet<String>,
+    ) -> Option<&'a SmsRecord> {
+        records.iter().find(|record| {
+            !baseline.contains(&record.fingerprint)
+                && record.direction == "inbound"
+                && record.peer == "191"
+                && record.multipart_complete
+                && is_viettel_balance_body(&record.body)
+        })
     }
 
     fn is_viettel_balance_body(body: &str) -> bool {
@@ -1345,10 +1377,12 @@ mod windows_host {
     #[cfg(test)]
     mod tests {
         use super::{
-            archive_commands, is_transient_call_release_error, is_viettel_balance_body,
-            modem_timestamp_ms, setting_matches, viettel_balance_message,
+            MULTIPART_ARCHIVE_GRACE_MS, archive_commands, find_balance_candidate,
+            find_persisted_balance_candidate, is_transient_call_release_error,
+            is_viettel_balance_body, modem_timestamp_ms, setting_matches, viettel_balance_message,
         };
-        use modemd::storage::SmsRecord;
+        use modemd::storage::{BalanceRecord, SmsRecord, Store};
+        use std::collections::HashSet;
 
         #[test]
         fn delivery_configuration_readback_ignores_modem_whitespace() {
@@ -1361,15 +1395,53 @@ mod windows_host {
             let records = vec![
                 SmsRecord {
                     storage_indices: vec![1, 3],
+                    multipart_complete: true,
                     ..Default::default()
                 },
                 SmsRecord {
                     storage_indices: vec![3, -1, 2],
+                    multipart_complete: true,
                     ..Default::default()
                 },
             ];
             assert_eq!(
-                archive_commands(&records),
+                archive_commands(&records, 0),
+                ["AT+CMGD=3", "AT+CMGD=2", "AT+CMGD=1"]
+            );
+        }
+
+        #[test]
+        fn archive_commands_give_incomplete_multipart_sms_time_to_finish() {
+            let received_at = 1_000_000;
+            let incomplete = SmsRecord {
+                storage_indices: vec![1, 2, 3],
+                part_count: 4,
+                parts_received: 3,
+                multipart_complete: false,
+                created_at_ms: received_at,
+                ..Default::default()
+            };
+            assert!(
+                archive_commands(
+                    std::slice::from_ref(&incomplete),
+                    received_at + MULTIPART_ARCHIVE_GRACE_MS - 1,
+                )
+                .is_empty()
+            );
+            assert_eq!(
+                archive_commands(
+                    std::slice::from_ref(&incomplete),
+                    received_at + MULTIPART_ARCHIVE_GRACE_MS,
+                ),
+                ["AT+CMGD=3", "AT+CMGD=2", "AT+CMGD=1"]
+            );
+
+            let complete = SmsRecord {
+                multipart_complete: true,
+                ..incomplete
+            };
+            assert_eq!(
+                archive_commands(&[complete], received_at),
                 ["AT+CMGD=3", "AT+CMGD=2", "AT+CMGD=1"]
             );
         }
@@ -1390,6 +1462,121 @@ mod windows_host {
             assert!(!is_viettel_balance_body(
                 "Quý khách đã đăng ký VoLTE thành công"
             ));
+        }
+
+        fn balance_sms(id: &str) -> SmsRecord {
+            SmsRecord {
+                id: id.into(),
+                direction: "inbound".into(),
+                peer: "191".into(),
+                body: "TK gốc: 85.500đ".into(),
+                source: "sim".into(),
+                storage: "SM".into(),
+                fingerprint: id.into(),
+                multipart_complete: true,
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn new_modem_resident_balance_reply_is_a_candidate() {
+            let reply = balance_sms("new-reply");
+            assert_eq!(
+                find_balance_candidate(&[reply], &HashSet::new()).map(|record| record.id.as_str()),
+                Some("new-reply")
+            );
+        }
+
+        #[test]
+        fn archived_persisted_balance_reply_is_found_and_linked() {
+            let store = Store::memory().unwrap();
+            let mut reply = balance_sms("canonical-sms");
+            store.sync_sms(std::slice::from_ref(&reply), 10).unwrap();
+            store
+                .mark_sms_archived(std::slice::from_ref(&reply))
+                .unwrap();
+            reply.present_on_modem = false;
+
+            let found = find_persisted_balance_candidate(&store, &HashSet::new())
+                .unwrap()
+                .unwrap();
+            assert_eq!(found.id, "canonical-sms");
+            assert!(!found.present_on_modem);
+        }
+
+        #[test]
+        fn pre_existing_balance_reply_cannot_satisfy_a_new_request() {
+            let reply = balance_sms("old-reply");
+            let baseline = HashSet::from([reply.fingerprint.clone()]);
+            assert!(find_balance_candidate(&[reply], &baseline).is_none());
+        }
+
+        #[test]
+        fn balance_candidate_rejects_wrong_sender_unrelated_body_and_incomplete_multipart() {
+            let mut wrong_sender = balance_sms("wrong-sender");
+            wrong_sender.peer = "123".into();
+            let mut outbound = balance_sms("outbound");
+            outbound.direction = "outbound".into();
+            let mut unrelated = balance_sms("unrelated");
+            unrelated.body = "Quy khach da dang ky VoLTE thanh cong".into();
+            let mut incomplete = balance_sms("incomplete");
+            incomplete.part_count = 2;
+            incomplete.parts_received = 1;
+            incomplete.multipart_complete = false;
+            assert!(
+                find_balance_candidate(
+                    &[wrong_sender, outbound, unrelated, incomplete],
+                    &HashSet::new()
+                )
+                .is_none()
+            );
+        }
+
+        #[test]
+        fn final_persisted_check_catches_reply_archived_at_deadline() {
+            let store = Store::memory().unwrap();
+            let reply = balance_sms("deadline-reply");
+            assert!(
+                find_persisted_balance_candidate(&store, &HashSet::new())
+                    .unwrap()
+                    .is_none()
+            );
+            store
+                .sync_sms(std::slice::from_ref(&reply), 30_000)
+                .unwrap();
+            store
+                .mark_sms_archived(std::slice::from_ref(&reply))
+                .unwrap();
+
+            let found = find_persisted_balance_candidate(&store, &HashSet::new())
+                .unwrap()
+                .unwrap();
+            assert_eq!(found.id, "deadline-reply");
+        }
+
+        #[test]
+        fn balance_result_uses_one_canonical_sms_and_one_history_record() {
+            let store = Store::memory().unwrap();
+            let reply = balance_sms("canonical-reply");
+            store.sync_sms(std::slice::from_ref(&reply), 1).unwrap();
+            store.sync_sms(std::slice::from_ref(&reply), 2).unwrap();
+            let canonical = find_persisted_balance_candidate(&store, &HashSet::new())
+                .unwrap()
+                .unwrap();
+            store
+                .save_balance(&BalanceRecord {
+                    id: "balance-check".into(),
+                    raw: canonical.body,
+                    sms_id: canonical.id,
+                    ..Default::default()
+                })
+                .unwrap();
+
+            let sms = store.list_sms(10).unwrap();
+            let balances = store.list_balances(10).unwrap();
+            assert_eq!(sms.len(), 1);
+            assert_eq!(balances.len(), 1);
+            assert_eq!(balances[0].sms_id, sms[0].id);
         }
 
         #[test]
