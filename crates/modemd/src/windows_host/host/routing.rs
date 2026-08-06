@@ -271,30 +271,55 @@ fn update_integration_settings(
     store: &Store,
     current: &Arc<RwLock<IntegrationSettings>>,
 ) -> Result<modemd::integration::PublicIntegrationSettings, String> {
-    let requested: value::Public =
+    let requested: value::Update =
         serde_json::from_value(value.get("settings").cloned().unwrap_or_default())
             .map_err(|_| "invalid integration settings payload".to_owned())?;
-    let mut settings = current
-        .read()
-        .unwrap_or_else(|lock| lock.into_inner())
-        .clone();
+    if requested.clear_rest_token && !requested.rest_token.trim().is_empty() {
+        return Err("REST token cannot be replaced and cleared in the same request".into());
+    }
+    if requested.clear_webhook_token && !requested.webhook_token.trim().is_empty() {
+        return Err("webhook token cannot be replaced and cleared in the same request".into());
+    }
+
+    // Hold the writer while deriving and committing the effective value so two
+    // concurrent clients cannot overwrite one another with stale snapshots.
+    let mut guard = current.write().unwrap_or_else(|lock| lock.into_inner());
+    let mut settings = guard.clone();
     settings.rest_enabled = requested.rest_enabled;
-    settings.rest_bind_address = requested.rest_bind_address;
-    settings.webhook_url = requested.webhook_url;
+    settings.rest_bind_address = requested.rest_bind_address.trim().to_owned();
+    settings.webhook_url = requested.webhook_url.trim().to_owned();
+    if requested.clear_rest_token {
+        settings.rest_token.clear();
+    } else if !requested.rest_token.trim().is_empty() {
+        settings.rest_token = requested.rest_token.trim().to_owned();
+    }
+    if requested.clear_webhook_token {
+        settings.webhook_token.clear();
+    } else if !requested.webhook_token.trim().is_empty() {
+        settings.webhook_token = requested.webhook_token.trim().to_owned();
+    }
     store
         .save_integration_settings(&settings, now())
         .map_err(|e| e.to_string())?;
-    *current.write().unwrap_or_else(|lock| lock.into_inner()) = settings.clone();
+    *guard = settings.clone();
     Ok((&settings).into())
 }
 
 mod value {
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
-    pub struct Public {
+    pub struct Update {
         pub rest_enabled: bool,
         pub rest_bind_address: String,
         pub webhook_url: String,
+        #[serde(default)]
+        pub rest_token: String,
+        #[serde(default)]
+        pub webhook_token: String,
+        #[serde(default)]
+        pub clear_rest_token: bool,
+        #[serde(default)]
+        pub clear_webhook_token: bool,
     }
 }
 
@@ -332,6 +357,114 @@ fn replace_integration_token(
         .map_err(|e| e.to_string())?;
     *current.write().unwrap_or_else(|lock| lock.into_inner()) = settings.clone();
     Ok((&settings).into())
+}
+
+#[cfg(test)]
+mod integration_settings_tests {
+    use super::*;
+
+    fn update(
+        store: &Store,
+        current: &Arc<RwLock<IntegrationSettings>>,
+        settings: serde_json::Value,
+    ) -> Result<modemd::integration::PublicIntegrationSettings, String> {
+        update_integration_settings(
+            &serde_json::json!({"command":"update_integration_settings","settings":settings}),
+            store,
+            current,
+        )
+    }
+
+    #[test]
+    fn atomic_update_replaces_preserves_and_clears_tokens() {
+        let store = Store::memory().unwrap();
+        let current = Arc::new(RwLock::new(IntegrationSettings::default()));
+        let public = update(
+            &store,
+            &current,
+            serde_json::json!({
+                "restEnabled":true,"restBindAddress":"127.0.0.1:5069",
+                "webhookUrl":"https://example.test/hook","restToken":"new-rest-token",
+                "webhookToken":"new-webhook-token"
+            }),
+        )
+        .unwrap();
+        assert!(public.has_rest_token);
+        assert!(public.has_webhook_token);
+        let serialized = serde_json::to_string(&public).unwrap();
+        assert!(!serialized.contains("new-rest-token"));
+        assert!(!serialized.contains("new-webhook-token"));
+
+        update(
+            &store,
+            &current,
+            serde_json::json!({
+                "restEnabled":true,"restBindAddress":"127.0.0.1:5070",
+                "webhookUrl":"https://example.test/next"
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            store.load_integration_settings().unwrap().rest_token,
+            "new-rest-token"
+        );
+
+        let public = update(
+            &store,
+            &current,
+            serde_json::json!({
+                "restEnabled":false,"restBindAddress":"127.0.0.1:5070",
+                "webhookUrl":"https://example.test/next","clearRestToken":true
+            }),
+        )
+        .unwrap();
+        assert!(!public.has_rest_token);
+        assert!(
+            store
+                .load_integration_settings()
+                .unwrap()
+                .rest_token
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn invalid_atomic_update_does_not_modify_persisted_or_runtime_settings() {
+        let store = Store::memory().unwrap();
+        let original = IntegrationSettings {
+            webhook_token: "preserved".into(),
+            ..IntegrationSettings::default()
+        };
+        store.save_integration_settings(&original, 1).unwrap();
+        let current = Arc::new(RwLock::new(original.clone()));
+
+        for invalid in [
+            serde_json::json!({
+                "restEnabled":true,"restBindAddress":"127.0.0.1:5069",
+                "webhookUrl":"https://example.test/hook"
+            }),
+            serde_json::json!({
+                "restEnabled":false,"restBindAddress":"not-an-address",
+                "webhookUrl":"https://example.test/hook"
+            }),
+            serde_json::json!({
+                "restEnabled":false,"restBindAddress":"127.0.0.1:5069",
+                "webhookUrl":"ftp://example.test/hook"
+            }),
+            serde_json::json!({
+                "restEnabled":false,"restBindAddress":"127.0.0.1:5069",
+                "webhookUrl":"https://example.test/hook","restToken":"replace",
+                "clearRestToken":true
+            }),
+        ] {
+            assert!(update(&store, &current, invalid).is_err());
+            assert_eq!(store.load_integration_settings().unwrap(), original);
+            assert_eq!(
+                *current.read().unwrap_or_else(|lock| lock.into_inner()),
+                original
+            );
+        }
+    }
 }
 pub(super) fn json_error(e: impl std::fmt::Display) -> String {
     serde_json::json!({"ok":false,"error":e.to_string()}).to_string() + "\n"

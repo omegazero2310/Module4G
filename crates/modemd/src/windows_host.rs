@@ -186,11 +186,12 @@ pub mod host {
         let (command_tx, command_rx) = mpsc::channel();
         let (sms_event_tx, sms_event_rx) = mpsc::channel();
         let monitor = tokio::task::spawn_blocking(move || {
+            // Drop the read guard before entering the lifetime-long monitor.
+            // Passing read().clone() directly as an argument extends the guard
+            // through the call and permanently blocks settings updates.
+            let initial_settings = settings_snapshot(&monitor_settings);
             hardware::monitor_with_commands(
-                monitor_settings
-                    .read()
-                    .unwrap_or_else(|lock| lock.into_inner())
-                    .clone(),
+                initial_settings,
                 monitor_stop_task,
                 |state| {
                     *monitor_capability
@@ -378,6 +379,13 @@ pub mod host {
         }
     }
 
+    fn settings_snapshot(settings: &RwLock<Settings>) -> Settings {
+        settings
+            .read()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .clone()
+    }
+
     struct HostDispatcher {
         command_tx: mpsc::Sender<hardware::AtRequest>,
         store: Arc<Store>,
@@ -507,10 +515,19 @@ pub mod host {
         use super::{
             MULTIPART_ARCHIVE_GRACE_MS, archive_commands, find_balance_candidate,
             find_persisted_balance_candidate, is_transient_call_release_error,
-            is_viettel_balance_body, modem_timestamp_ms, setting_matches, viettel_balance_message,
+            is_viettel_balance_body, modem_timestamp_ms, setting_matches, settings_snapshot,
+            viettel_balance_message,
         };
+        use modemd::settings::Settings;
         use modemd::storage::{BalanceRecord, SmsRecord, Store};
-        use std::collections::HashSet;
+        use std::{collections::HashSet, sync::RwLock};
+
+        #[test]
+        fn monitor_settings_snapshot_releases_the_read_lock() {
+            let settings = RwLock::new(Settings::default());
+            let _snapshot = settings_snapshot(&settings);
+            assert!(settings.try_write().is_ok());
+        }
 
         #[test]
         fn delivery_configuration_readback_ignores_modem_whitespace() {

@@ -64,6 +64,14 @@ mod tests {
             ),
             "JSON response received (SMS and balance content redacted)"
         );
+        let integration_request = r#"{"command":"update_integration_settings","settings":{"restToken":"never-log-this","webhookToken":"also-secret"}}"#;
+        let logged = logged_request(integration_request);
+        assert_eq!(
+            logged,
+            "JSON update_integration_settings (SMS and balance content redacted)"
+        );
+        assert!(!logged.contains("never-log-this"));
+        assert!(!logged.contains("also-secret"));
     }
 
     #[test]

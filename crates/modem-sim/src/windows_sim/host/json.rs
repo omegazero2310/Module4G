@@ -23,13 +23,10 @@ pub(super) fn json_response(request: &str, state: &mut SimState) -> Option<Strin
             }))})
         }
         "update_integration_settings" => {
-            let mut settings = value.get("settings").cloned().unwrap_or_default();
-            let old = state.integration_settings.clone().unwrap_or_default();
-            settings["hasRestToken"] = old.get("hasRestToken").cloned().unwrap_or(false.into());
-            settings["hasWebhookToken"] =
-                old.get("hasWebhookToken").cloned().unwrap_or(false.into());
-            state.integration_settings = Some(settings.clone());
-            serde_json::json!({"ok":true,"data":settings})
+            match atomic_integration_update(value.get("settings"), state) {
+                Ok(settings) => serde_json::json!({"ok":true,"data":settings}),
+                Err(error) => serde_json::json!({"ok":false,"error":error}),
+            }
         }
         "replace_rest_token"
         | "clear_rest_token"
@@ -289,6 +286,97 @@ pub(super) fn json_response(request: &str, state: &mut SimState) -> Option<Strin
         _ => return None,
     };
     Some(result.to_string() + "\n")
+}
+
+fn atomic_integration_update(
+    requested: Option<&serde_json::Value>,
+    state: &mut SimState,
+) -> Result<serde_json::Value, String> {
+    let requested = requested
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "invalid integration settings payload".to_owned())?;
+    let string = |name: &str| {
+        requested
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "invalid integration settings payload".to_owned())
+    };
+    let boolean = |name: &str| {
+        requested
+            .get(name)
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| "invalid integration settings payload".to_owned())
+    };
+    let rest_enabled = boolean("restEnabled")?;
+    let rest_bind_address = string("restBindAddress")?.trim();
+    let webhook_url = string("webhookUrl")?.trim();
+    let rest_token = requested
+        .get("restToken")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    let webhook_token = requested
+        .get("webhookToken")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    let clear_rest = requested
+        .get("clearRestToken")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let clear_webhook = requested
+        .get("clearWebhookToken")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if clear_rest && !rest_token.is_empty() {
+        return Err("REST token cannot be replaced and cleared in the same request".into());
+    }
+    if clear_webhook && !webhook_token.is_empty() {
+        return Err("webhook token cannot be replaced and cleared in the same request".into());
+    }
+    if rest_bind_address.parse::<std::net::SocketAddr>().is_err() {
+        return Err("REST bind address must be an IP address and port".into());
+    }
+    let valid_webhook = ["http://", "https://"].iter().any(|prefix| {
+        webhook_url
+            .strip_prefix(prefix)
+            .is_some_and(|remainder| !remainder.is_empty() && !remainder.starts_with('/'))
+    });
+    if !valid_webhook {
+        return Err("webhook URL must use http or https".into());
+    }
+
+    let old = state.integration_settings.as_ref();
+    let mut has_rest_token = old
+        .and_then(|settings| settings.get("hasRestToken"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let mut has_webhook_token = old
+        .and_then(|settings| settings.get("hasWebhookToken"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if clear_rest {
+        has_rest_token = false;
+    } else if !rest_token.is_empty() {
+        has_rest_token = true;
+    }
+    if clear_webhook {
+        has_webhook_token = false;
+    } else if !webhook_token.is_empty() {
+        has_webhook_token = true;
+    }
+    if rest_enabled && !has_rest_token {
+        return Err("REST requires a bearer token before it can be enabled".into());
+    }
+    let settings = serde_json::json!({
+        "restEnabled":rest_enabled,
+        "restBindAddress":rest_bind_address,
+        "webhookUrl":webhook_url,
+        "hasRestToken":has_rest_token,
+        "hasWebhookToken":has_webhook_token
+    });
+    state.integration_settings = Some(settings.clone());
+    Ok(settings)
 }
 
 pub(super) fn sms_record(

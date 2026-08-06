@@ -48,6 +48,41 @@ pub mod host {
         }
 
         #[test]
+        fn integration_settings_update_is_atomic_and_persistent() {
+            let mut state = SimState::default();
+            let updated = json_response(
+                r#"{"command":"update_integration_settings","settings":{"restEnabled":true,"restBindAddress":"127.0.0.1:5069","webhookUrl":"https://example.test/hook","restToken":"secret","webhookToken":"","clearRestToken":false,"clearWebhookToken":false}}"#,
+                &mut state,
+            )
+            .unwrap();
+            let updated: serde_json::Value = serde_json::from_str(updated.trim()).unwrap();
+            assert_eq!(updated["ok"], true);
+            assert_eq!(updated["data"]["hasRestToken"], true);
+            assert!(updated["data"].get("restToken").is_none());
+
+            let read =
+                json_response(r#"{"command":"get_integration_settings"}"#, &mut state).unwrap();
+            assert!(read.contains(r#""hasRestToken":true"#));
+            assert!(!read.contains("secret"));
+
+            let before = state.integration_settings.clone();
+            let rejected = json_response(
+                r#"{"command":"update_integration_settings","settings":{"restEnabled":true,"restBindAddress":"invalid","webhookUrl":"https://example.test/hook","restToken":"replacement","clearRestToken":true}}"#,
+                &mut state,
+            )
+            .unwrap();
+            assert!(rejected.contains(r#""ok":false"#));
+            assert_eq!(state.integration_settings, before);
+
+            let cleared = json_response(
+                r#"{"command":"update_integration_settings","settings":{"restEnabled":false,"restBindAddress":"127.0.0.1:5069","webhookUrl":"https://example.test/hook","clearRestToken":true}}"#,
+                &mut state,
+            )
+            .unwrap();
+            assert!(cleared.contains(r#""hasRestToken":false"#));
+        }
+
+        #[test]
         fn desktop_smoke_covers_workflows_and_failure_scenarios() {
             let mut state = SimState::default();
             let mut legacy = CallScenario::default();
