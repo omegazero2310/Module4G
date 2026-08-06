@@ -83,8 +83,16 @@ describe("Settings page", () => {
     render(<SettingsPage/>);
     const override = await screen.findByLabelText("Port override");
     const restToken = screen.getByLabelText("Replace REST bearer token") as HTMLInputElement;
+    const copyToken = screen.getByRole("button", { name: "Copy token" });
+    expect(copyToken).toBeDisabled();
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
     await userEvent.click(screen.getByRole("button", { name: "Generate token" }));
     expect(restToken.value).toMatch(/^[0-9a-f]{64}$/);
+    expect(copyToken).toBeEnabled();
+    await userEvent.click(copyToken);
+    expect(writeText).toHaveBeenCalledWith(restToken.value);
+    expect(screen.getByText("REST bearer token copied to the clipboard.")).toBeInTheDocument();
     expect(screen.getByLabelText("Clear stored REST token")).not.toBeChecked();
     await userEvent.type(override, "COM9");
     await userEvent.click(screen.getByRole("button", { name: "Save settings" }));
