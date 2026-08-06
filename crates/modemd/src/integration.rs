@@ -227,11 +227,16 @@ async fn process_request(
             .map_err(|error| (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()))?;
     }
     let audio_id = if matches!(request.channel, Channel::Call) {
-        Some(
+        let audio = if request.content.trim().is_empty() {
+            state.store.current_audio().map_err(internal)?
+        } else {
             state
                 .store
                 .audio_named(&request.content)
                 .map_err(internal)?
+        };
+        Some(
+            audio
                 .ok_or_else(|| {
                     (
                         StatusCode::UNPROCESSABLE_ENTITY,
@@ -571,7 +576,7 @@ pub async fn deliver_webhooks(store: Arc<Store>, settings: Arc<RwLock<Integratio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::SmsRecord;
+    use crate::storage::{CallRecord, SmsRecord, UploadedAudioRecord};
     use axum::http::{Request, header};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
@@ -579,6 +584,7 @@ mod tests {
     struct MockDispatcher {
         store: Arc<Store>,
         sends: AtomicUsize,
+        calls: AtomicUsize,
     }
 
     #[async_trait]
@@ -608,11 +614,23 @@ mod tests {
 
         async fn make_call(
             &self,
-            _id: String,
-            _destination: String,
-            _audio_id: String,
+            id: String,
+            destination: String,
+            audio_id: String,
         ) -> Result<(), DispatchError> {
-            Err(DispatchError::Validation("audio unavailable".into()))
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.store
+                .save_call(&CallRecord {
+                    id,
+                    peer: destination,
+                    audio_id,
+                    state: "waiting-for-answer".into(),
+                    created_at_ms: now_ms(),
+                    answer_classification: "unknown".into(),
+                    end_reason: "none".into(),
+                    ..Default::default()
+                })
+                .map_err(|error| DispatchError::Failed(error.to_string()))
         }
     }
 
@@ -621,6 +639,7 @@ mod tests {
         let dispatcher = Arc::new(MockDispatcher {
             store: Arc::clone(&store),
             sends: AtomicUsize::new(0),
+            calls: AtomicUsize::new(0),
         });
         let settings = Arc::new(RwLock::new(IntegrationSettings {
             rest_enabled: true,
@@ -716,6 +735,38 @@ mod tests {
                 StatusCode::UNPROCESSABLE_ENTITY
             );
         }
+    }
+
+    #[tokio::test]
+    async fn empty_call_content_uses_current_audio() {
+        let (app, dispatcher) = fixture();
+        dispatcher
+            .store
+            .save_current_audio(&UploadedAudioRecord {
+                id: "default-audio".into(),
+                name: "default.amr".into(),
+                format: "AMR-NB".into(),
+                size: 19,
+                module_path: "call_default-audio.amr".into(),
+                duration_ms: 20,
+                created_at_ms: 1,
+                state: "ready".into(),
+                is_current: true,
+            })
+            .unwrap();
+        let response = app
+            .oneshot(request(
+                serde_json::json!({"from":"desk","to":"0912345678","channel":"call","content":""}),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(dispatcher.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            dispatcher.store.list_calls(1).unwrap()[0].audio_id,
+            "default-audio"
+        );
     }
 
     #[test]

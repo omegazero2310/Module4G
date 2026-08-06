@@ -23,6 +23,9 @@ persisted in SQLite. Only REST-created outbound communications emit webhooks. Th
 until a bearer token is stored; plain HTTP deployments must remain on a firewall-restricted trusted
 LAN because bearer tokens and communication content are not encrypted in transit.
 
+For REST calls, a non-empty `content` selects an uploaded AMR file by case-insensitive filename.
+Empty or whitespace-only `content` uses the currently selected AMR file.
+
 ## 2. Language choice
 
 **Daemon: Rust.**

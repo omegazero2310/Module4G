@@ -40,7 +40,8 @@ store from blocking inbound SMS or stored delivery reports while preserving the 
 The Windows service can expose `POST /api/v1/communications` on the configurable REST listener
 (default `0.0.0.0:5069`). REST is disabled by default and cannot be enabled until a bearer token has
 been stored on the Settings page. Requests support `sms` and `call` channels, UUID idempotency, and
-immediate work only; call content is the case-insensitive name of an uploaded AMR-NB file.
+immediate work only. Call content is the case-insensitive name of an uploaded AMR-NB file; empty
+call content uses the currently selected AMR file and returns validation error if none is selected.
 
 Only REST-created communications produce lifecycle webhooks. Delivery uses a durable SQLite outbox,
 preserves event order for each communication, disables redirects, and retries until a 2xx response.
