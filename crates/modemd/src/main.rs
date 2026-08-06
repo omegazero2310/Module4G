@@ -395,7 +395,7 @@ mod windows_host {
                 let mut fields = rest.splitn(2, '|');
                 let destination = fields.next().unwrap_or_default();
                 let body = fields.next().and_then(decode_hex);
-                match (modemd::sms::normalize_number(destination), body) {
+                match (modemd::sms::normalize_sms_destination(destination), body) {
                     (Ok(destination), Some(body)) => {
                         run_actor(
                             &command_tx,
@@ -420,7 +420,7 @@ mod windows_host {
                     run_actor(&command_tx, format!("AT+CUSD=1,\"{code}\",15"), None, false).await
                 }
             } else if let Some(number) = request.strip_prefix("DIAL|") {
-                match modemd::sms::normalize_number(number) {
+                match modemd::sms::normalize_call_destination(number) {
                     Ok(number) => dial_with_release_retry(&command_tx, &number).await,
                     Err(error) => format!("ERROR: {error}\n"),
                 }
@@ -621,7 +621,7 @@ mod windows_host {
         value: serde_json::Value,
         manager: &Arc<CallManager>,
     ) -> Result<modemd::storage::CallRecord, String> {
-        let destination = modemd::sms::normalize_number(
+        let destination = modemd::sms::normalize_call_destination(
             value
                 .get("destination")
                 .and_then(|value| value.as_str())
@@ -645,7 +645,7 @@ mod windows_host {
         delivery_capability: &Arc<RwLock<DeliveryCapability>>,
         delivery_configuration: &Arc<tokio::sync::Mutex<()>>,
     ) -> Result<SmsRecord, String> {
-        let peer = modemd::sms::normalize_number(
+        let peer = modemd::sms::normalize_sms_destination(
             v.get("destination")
                 .and_then(|x| x.as_str())
                 .unwrap_or_default(),

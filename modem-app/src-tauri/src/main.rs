@@ -523,7 +523,8 @@ async fn send_sms(
     body: String,
     _state: tauri::State<'_, AppState>,
 ) -> Result<Record, String> {
-    let destination = modemd::sms::normalize_number(&destination).map_err(|e| e.to_string())?;
+    let destination =
+        modemd::sms::normalize_sms_destination(&destination).map_err(|e| e.to_string())?;
     let encoding = modemd::sms::validate_body(&body).map_err(|e| e.to_string())?;
     if encoding != "GSM-7" {
         return Err("UCS2 modem transmission is not available yet; use GSM-7 text".into());
@@ -580,7 +581,8 @@ async fn make_call(
     audio_id: String,
     _state: tauri::State<'_, AppState>,
 ) -> Result<Record, String> {
-    let destination = modemd::sms::normalize_number(&destination).map_err(|e| e.to_string())?;
+    let destination =
+        modemd::sms::normalize_call_destination(&destination).map_err(|e| e.to_string())?;
     request_json(serde_json::json!({
         "command":"make_call",
         "destination":destination,
@@ -714,15 +716,15 @@ mod tests {
     #[test]
     fn console_logging_redacts_private_request_data() {
         assert_eq!(
-            logged_request("SMS|+66812345678|48656C6C6F"),
+            logged_request("SMS|191|48656C6C6F"),
             "SMS send (destination and message redacted)"
         );
         assert_eq!(
-            logged_request("DIAL|+66812345678"),
+            logged_request("DIAL|+84912345678"),
             "DIAL (destination redacted)"
         );
         assert_eq!(
-            logged_response("AT+CLCC", "+CLCC: 1,0,0,0,0,\"+66812345678\",145\r\nOK\n"),
+            logged_response("AT+CLCC", "+CLCC: 1,0,0,0,0,\"+84912345678\",145\r\nOK\n"),
             "+CLCC: 1,0,0,0,0,\"+<redacted-number>\",145 | OK"
         );
         assert_eq!(

@@ -751,6 +751,9 @@ fn reconcile_stored_submissions(
 }
 
 fn normalize_peer(value: &str) -> String {
+    if let Ok(peer) = crate::sms::normalize_sms_destination(value) {
+        return peer;
+    }
     let digits: String = value.chars().filter(char::is_ascii_digit).collect();
     digits.strip_prefix("00").unwrap_or(&digits).to_owned()
 }
@@ -907,7 +910,7 @@ mod tests {
             .save_sms(&SmsRecord {
                 id: "app".into(),
                 direction: "outbound".into(),
-                peer: "+66812345678".into(),
+                peer: "+84912345678".into(),
                 body: "hello".into(),
                 state: "submitted".into(),
                 message_reference: "42".into(),
@@ -922,7 +925,7 @@ mod tests {
                 &[SmsRecord {
                     id: "copy".into(),
                     direction: "outbound".into(),
-                    peer: "+66812345678".into(),
+                    peer: "0912345678".into(),
                     body: "hello".into(),
                     state: "submitted".into(),
                     message_reference: "42".into(),
@@ -1104,7 +1107,7 @@ mod tests {
         s.save_sms(&SmsRecord {
             id: "sent".into(),
             direction: "outbound".into(),
-            peer: "+66812345678".into(),
+            peer: "+84912345678".into(),
             message_reference: "42".into(),
             state: "submitted".into(),
             kind: "submitted".into(),
@@ -1113,10 +1116,10 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        let report = |id: &str, index, status: &str| SmsRecord {
+        let report = |id: &str, index, peer: &str, status: &str| SmsRecord {
             id: id.into(),
             direction: "inbound".into(),
-            peer: "+66812345678".into(),
+            peer: peer.into(),
             message_reference: "42".into(),
             state: "status-report".into(),
             kind: "status-report".into(),
@@ -1131,7 +1134,8 @@ mod tests {
             multipart_complete: true,
             ..Default::default()
         };
-        s.sync_sms(&[report("pending", 1, "0x20")], 20).unwrap();
+        s.sync_sms(&[report("pending", 1, "0912345678", "0x20")], 20)
+            .unwrap();
         assert_eq!(s.list_sms(10).unwrap().len(), 1);
         assert_eq!(
             s.list_sms(10)
@@ -1142,7 +1146,8 @@ mod tests {
                 .state,
             "delivery-pending"
         );
-        s.sync_sms(&[report("delivered", 2, "0x00")], 30).unwrap();
+        s.sync_sms(&[report("delivered", 2, "0084912345678", "0x00")], 30)
+            .unwrap();
         let sent = s
             .list_sms(10)
             .unwrap()

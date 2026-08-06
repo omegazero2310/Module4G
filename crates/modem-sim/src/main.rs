@@ -368,7 +368,7 @@ mod windows_sim {
             return "{\"ok\":true,\"data\":{\"id\":\"balance-1\",\"raw\":\"Tai khoan goc: 85.500d\\nKhuyen mai: 89.174d\",\"value\":null,\"currency\":\"\",\"error\":\"\",\"createdAtMs\":1785722400000,\"smsId\":\"balance-sms-1\"}}\n";
         }
         if command.contains("\"command\":\"send_sms\"") {
-            return "{\"ok\":true,\"data\":{\"id\":\"sent-1\",\"direction\":\"outbound\",\"peer\":\"+66812345678\",\"body\":\"simulated\",\"state\":\"submitted\",\"detail\":\"\",\"createdAtMs\":1785722400000,\"answerClassification\":\"\",\"endReason\":\"\",\"alertingAtMs\":0,\"releaseCause\":\"\",\"kind\":\"submitted\",\"source\":\"app\",\"storage\":\"\",\"storageIndex\":-1,\"modemStatus\":\"\",\"modemTimestamp\":\"\",\"encoding\":\"GSM-7\",\"dcs\":-1,\"length\":9,\"serviceCenter\":\"\",\"messageReference\":\"42\",\"deliveryStatus\":\"\",\"synchronizedAtMs\":0,\"presentOnModem\":false,\"smsId\":\"\"}}\n";
+            return "{\"ok\":true,\"data\":{\"id\":\"sent-1\",\"direction\":\"outbound\",\"peer\":\"+84912345678\",\"body\":\"simulated\",\"state\":\"submitted\",\"detail\":\"\",\"createdAtMs\":1785722400000,\"answerClassification\":\"\",\"endReason\":\"\",\"alertingAtMs\":0,\"releaseCause\":\"\",\"kind\":\"submitted\",\"source\":\"app\",\"storage\":\"\",\"storageIndex\":-1,\"modemStatus\":\"\",\"modemTimestamp\":\"\",\"encoding\":\"GSM-7\",\"dcs\":-1,\"length\":9,\"serviceCenter\":\"\",\"messageReference\":\"42\",\"deliveryStatus\":\"\",\"synchronizedAtMs\":0,\"presentOnModem\":false,\"smsId\":\"\"}}\n";
         }
         if command.starts_with("SMS|") {
             return "+CMGS: 42\r\nOK\n";

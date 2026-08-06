@@ -570,22 +570,60 @@ fn quoted_csv(input: &str) -> Vec<String> {
     r.push(v.trim().into());
     r
 }
-pub fn normalize_number(input: &str) -> Result<String, ModemError> {
-    let compact: String = input
+fn compact_destination(input: &str) -> String {
+    input
         .chars()
         .filter(|c| !matches!(c, ' ' | '-' | '(' | ')'))
-        .collect();
-    let digits = compact.strip_prefix('+').unwrap_or(&compact);
-    if !compact.starts_with('+')
-        || !(7..=15).contains(&digits.len())
-        || !digits.chars().all(|c| c.is_ascii_digit())
-    {
-        Err(ModemError::Validation(
-            "use an international number such as +66812345678".into(),
-        ))
+        .collect()
+}
+
+fn normalize_subscriber_destination(input: &str) -> Option<String> {
+    let subscriber = if let Some(subscriber) = input.strip_prefix("+84") {
+        subscriber
+    } else if let Some(subscriber) = input.strip_prefix("0084") {
+        subscriber
+    } else if let Some(subscriber) = input.strip_prefix('0') {
+        subscriber
     } else {
-        Ok(compact)
+        let digits = input.strip_prefix('+')?;
+        return ((7..=15).contains(&digits.len()) && digits.chars().all(|c| c.is_ascii_digit()))
+            .then(|| input.to_owned());
+    };
+    ((9..=10).contains(&subscriber.len())
+        && matches!(
+            subscriber.bytes().next(),
+            Some(b'2' | b'3' | b'5' | b'7' | b'8' | b'9')
+        )
+        && subscriber.chars().all(|c| c.is_ascii_digit()))
+    .then(|| format!("+84{subscriber}"))
+}
+
+/// Normalize a destination accepted for SMS submission. Vietnamese subscriber
+/// numbers are stored in canonical `+84` form; numeric service codes are kept
+/// unchanged.
+pub fn normalize_sms_destination(input: &str) -> Result<String, ModemError> {
+    let compact = compact_destination(input);
+    if (3..=6).contains(&compact.len()) && compact.chars().all(|c| c.is_ascii_digit()) {
+        return Ok(compact);
     }
+    normalize_subscriber_destination(&compact).ok_or_else(|| {
+        ModemError::Validation(
+            "use a Vietnamese number such as 0912345678, an international + number, or a 3-6 digit SMS service code"
+                .into(),
+        )
+    })
+}
+
+/// Normalize a destination accepted for voice calls. Service codes are
+/// intentionally excluded.
+pub fn normalize_call_destination(input: &str) -> Result<String, ModemError> {
+    let compact = compact_destination(input);
+    normalize_subscriber_destination(&compact).ok_or_else(|| {
+        ModemError::Validation(
+            "use a Vietnamese number such as 0912345678 or an international number such as +84912345678; SMS service codes cannot be called"
+                .into(),
+        )
+    })
 }
 pub fn validate_body(body: &str) -> Result<&'static str, ModemError> {
     if body.is_empty() {
@@ -684,8 +722,55 @@ mod tests {
     }
     #[test]
     fn validates() {
-        assert!(normalize_number("+66812345678").is_ok());
+        assert!(normalize_call_destination("+66812345678").is_ok());
         assert_eq!(ucs2_hex("Aก"), "00410E01")
+    }
+    #[test]
+    fn normalizes_supported_vietnamese_destinations() {
+        for (input, expected) in [
+            ("0912345678", "+84912345678"),
+            ("02345678901", "+842345678901"),
+            ("0084912345678", "+84912345678"),
+            ("00842345678901", "+842345678901"),
+            ("+84912345678", "+84912345678"),
+            ("+842345678901", "+842345678901"),
+            ("(0912) 345-678", "+84912345678"),
+        ] {
+            assert_eq!(normalize_sms_destination(input).unwrap(), expected);
+            assert_eq!(normalize_call_destination(input).unwrap(), expected);
+        }
+    }
+    #[test]
+    fn sms_accepts_only_three_to_six_digit_service_codes() {
+        for code in ["191", "262", "195", "9969", "123456"] {
+            assert_eq!(normalize_sms_destination(code).unwrap(), code);
+        }
+        for invalid in ["12", "1234567"] {
+            assert!(normalize_sms_destination(invalid).is_err());
+        }
+        for code in ["191", "262", "195", "9969"] {
+            assert!(normalize_call_destination(code).is_err());
+        }
+    }
+    #[test]
+    fn rejects_invalid_or_unsafe_destinations() {
+        for invalid in [
+            "0112345678",
+            "0084112345678",
+            "+84112345678",
+            "091234567",
+            "091234567890",
+            "+123456",
+            "+1234567890123456",
+            "0912345678x",
+            "09A2345678",
+            "0912345678\r",
+            "0912345678;ATH",
+            "0912345678,",
+        ] {
+            assert!(normalize_sms_destination(invalid).is_err(), "{invalid:?}");
+            assert!(normalize_call_destination(invalid).is_err(), "{invalid:?}");
+        }
     }
     #[test]
     fn malformed_pdu_is_lossless() {
