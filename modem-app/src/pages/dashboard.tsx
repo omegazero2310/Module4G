@@ -1,0 +1,5 @@
+import type { Status } from "../types";
+import { Card } from "../components";
+
+export function Dashboard({status}:{status:Status}){const guidance=status.state.toLowerCase().includes("busy")?`Close the application using ${status.port||"the AT port"}; reconnection is automatic.`:status.state!=="Ready"?"Check the USB cable, SIMCom driver, and Windows service.":"";return <><div className="cards"><Card label="Service" value={status.serviceVersion}/><Card label="Modem" value={status.state}/><Card label="COM port" value={status.port}/><Card label="SIM" value={status.simState}/><Card label="Network" value={status.registration}/><Card label="Signal" value={`${status.signalRssi} RSSI`}/></div>{(status.lastError||guidance)&&<div className="warning"><strong>Connection guidance</strong><p>{status.lastError||guidance}</p></div>}{status.state==="Ready"&&!status.deliveryTrackingAvailable&&<div className="warning"><strong>SMS delivery tracking degraded</strong><p>{status.deliveryTrackingError||"Delivery report configuration has not been verified. SMS submission remains available."}</p></div>}</>}
+
