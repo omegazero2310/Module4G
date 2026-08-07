@@ -642,10 +642,16 @@ pub fn normalize_source_state(
             _ => ("sending", String::new()),
         };
     }
+    // A daemon-initiated hang-up is not a failed delivery. Before pickup the
+    // accepted dial remains sent; after pickup the answered classification
+    // below keeps it delivered.
+    if end_reason == "local-hang-up" && answer != "answered" {
+        return ("sent", String::new());
+    }
     if answer == "not-answered" || matches!(end_reason, "no-answer" | "busy" | "signaling-timeout")
     {
         return (
-            "missed",
+            "failed",
             safe_failure_reason(if error.is_empty() { end_reason } else { error }),
         );
     }
@@ -887,7 +893,7 @@ pub async fn deliver_webhooks(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{CallRecord, SmsRecord, UploadedAudioRecord};
+    use crate::storage::{CallRecord, SmsRecord, Store, UploadedAudioRecord};
     use axum::http::{Request, header};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
@@ -1142,16 +1148,124 @@ mod tests {
         );
         assert_eq!(
             normalize_source_state("call", "ended", "", "not-answered", "no-answer").0,
-            "missed"
+            "failed"
         );
         assert_eq!(
             normalize_source_state("call", "failed", "timeout", "unknown", "signaling-timeout").0,
-            "missed"
+            "failed"
+        );
+        for (state, error, answer, end_reason) in [
+            ("ended", "", "not-answered", "busy"),
+            ("ended", "", "not-answered", "no-answer"),
+            ("failed", "timed out", "unknown", "signaling-timeout"),
+            ("ended", "network unavailable", "unknown", "network-error"),
+            ("ended", "remote ended", "unknown", "call-error"),
+        ] {
+            let (status, reason) = normalize_source_state("call", state, error, answer, end_reason);
+            assert_eq!(status, "failed");
+            assert!(!reason.is_empty());
+        }
+        assert_eq!(
+            normalize_source_state("call", "ended", "", "answered", "remote-hang-up").0,
+            "delivered"
+        );
+        assert_eq!(
+            normalize_source_state("call", "ended", "", "unknown", "local-hang-up").0,
+            "sent"
+        );
+        assert_eq!(
+            normalize_source_state("call", "ended", "", "answered", "local-hang-up").0,
+            "delivered"
         );
         assert_eq!(
             (0..7).map(retry_delay_ms).collect::<Vec<_>>(),
             vec![1_000, 5_000, 30_000, 120_000, 600_000, 3_600_000, 3_600_000]
         );
+    }
+
+    #[test]
+    fn call_webhooks_use_sent_delivered_and_failed_without_local_hang_up_failure() {
+        let store = Store::memory().unwrap();
+        let reserve = |id: &str| {
+            store
+                .reserve_rest_communication(&RestCommunication {
+                    id: id.into(),
+                    request_id: format!("request-{id}"),
+                    record_id: id.into(),
+                    channel: "call".into(),
+                    owner: "desk".into(),
+                    destination: "+84912345678".into(),
+                    content: "audio".into(),
+                    payload_fingerprint: format!("fingerprint-{id}"),
+                    status: "sending".into(),
+                    created_at_ms: 1,
+                    ..Default::default()
+                })
+                .unwrap();
+        };
+        let waiting = |id: &str| CallRecord {
+            id: id.into(),
+            state: "waiting-for-answer".into(),
+            created_at_ms: 1,
+            answer_classification: "unknown".into(),
+            end_reason: "none".into(),
+            ..Default::default()
+        };
+
+        reserve("busy");
+        let mut busy = waiting("busy");
+        store.save_call(&busy).unwrap();
+        store.reconcile_rest_communications(2).unwrap();
+        let sent = store.next_webhook(2).unwrap().unwrap();
+        assert_eq!(sent.event_type, "communication.sent");
+        store.complete_webhook(sent.id, 2).unwrap();
+        busy.state = "ended".into();
+        busy.answer_classification = "not-answered".into();
+        busy.end_reason = "busy".into();
+        busy.error = "busy".into();
+        busy.ended_at_ms = 3;
+        store.save_call(&busy).unwrap();
+        store.reconcile_rest_communications(3).unwrap();
+        let failed = store.next_webhook(3).unwrap().unwrap();
+        assert_eq!(failed.event_type, "communication.failed");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&failed.payload).unwrap()["data"]["failure_reason"],
+            "busy"
+        );
+        store.complete_webhook(failed.id, 3).unwrap();
+
+        reserve("remote");
+        let mut remote = waiting("remote");
+        store.save_call(&remote).unwrap();
+        store.reconcile_rest_communications(4).unwrap();
+        let sent = store.next_webhook(4).unwrap().unwrap();
+        assert_eq!(sent.event_type, "communication.sent");
+        store.complete_webhook(sent.id, 4).unwrap();
+        remote.state = "ended".into();
+        remote.answer_classification = "answered".into();
+        remote.end_reason = "remote-hang-up".into();
+        remote.connected_at_ms = 4;
+        remote.ended_at_ms = 5;
+        store.save_call(&remote).unwrap();
+        store.reconcile_rest_communications(5).unwrap();
+        let delivered = store.next_webhook(5).unwrap().unwrap();
+        assert_eq!(delivered.event_type, "communication.delivered");
+        store.complete_webhook(delivered.id, 5).unwrap();
+        assert!(store.next_webhook(5).unwrap().is_none());
+
+        reserve("local");
+        let mut local = waiting("local");
+        store.save_call(&local).unwrap();
+        store.reconcile_rest_communications(6).unwrap();
+        let sent = store.next_webhook(6).unwrap().unwrap();
+        assert_eq!(sent.event_type, "communication.sent");
+        store.complete_webhook(sent.id, 6).unwrap();
+        local.state = "ended".into();
+        local.end_reason = "local-hang-up".into();
+        local.ended_at_ms = 7;
+        store.save_call(&local).unwrap();
+        store.reconcile_rest_communications(7).unwrap();
+        assert!(store.next_webhook(7).unwrap().is_none());
     }
 
     #[test]
