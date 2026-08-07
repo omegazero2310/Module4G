@@ -1,91 +1,181 @@
 # A7670 Modem
 
-Windows 10/11 x64 software for a single SIMCom A7670C-LANS module. The repository is a Rust
-workspace with a protobuf contract, daemon core, deterministic simulator, and a Tauri 2 UI.
+Windows 10/11 x64 desktop software for one SIMCom A7670C-LANS modem. The solution pairs a Rust Windows service (the only production owner of the modem serial port) with a Tauri 2 / React desktop application. It supports SMS, delivery reports, AMR-NB audio upload and calls, balance checks, local history, and an authenticated REST/webhook integration.
 
-## Development
+## Prerequisites
 
-Prerequisites are Rust stable, Node.js 20+, the MSVC C++ build tools, and WebView2. `protoc` is
-vendored by the Rust build. Run:
+- Windows 10 or 11 x64.
+- Rust stable with the MSVC toolchain (`rustup default stable-x86_64-pc-windows-msvc`).
+- Visual Studio Build Tools with **Desktop development with C++** and a Windows SDK.
+- Node.js 20 or newer and npm.
+- Microsoft Edge WebView2 Runtime (normally already present on supported Windows installations).
+- An A7670C-LANS modem and its Windows USB serial driver for physical-modem use.
+
+`protoc` is supplied by the Rust build, so it does not need a separate installation.
+
+## Project structure
+
+| Path | Purpose |
+| --- | --- |
+| `crates/modemd/` | Daemon core and `modemd.exe` Windows service. Owns AT/serial communication, workflows, SQLite, named-pipe host, REST, and webhooks. |
+| `crates/modem-proto/` | Versioned protobuf API source in `proto/modemd/v1/modem.proto` and generated Rust types. It is the public contract reference; the current Windows transport itself is JSON over a named pipe. |
+| `crates/modem-sim/` | Deterministic Windows named-pipe simulator for UI and protocol development without hardware. |
+| `modem-app/src/` | React 19 UI: dashboard, SMS, calls/audio, balance, settings, diagnostics, types, formatters, and Vitest tests. |
+| `modem-app/src-tauri/` | Tauri native layer. It is the sole UI component that can access the local service pipe and exposes Tauri commands to React. |
+| `scripts/` | Elevated service install/remove scripts and the direct AMR upload diagnostic utility. |
+| `a7670c-*.md` | SIMCom hardware behavior, acceptance context, and delivery-status notes. |
+
+## How it works
+
+### Runtime boundary
+
+```text
+React UI
+  -> Tauri commands (Rust)
+    -> \\.\pipe\a7670-modemd-v1 (local-only JSON; legacy lines retained)
+      -> modemd Windows service
+        -> serialized AT command actor -> A7670 serial/AT port
+        -> SQLite: %ProgramData%\A7670 Modem\modemd.sqlite3
+
+External LAN client -> authenticated REST listener -> modemd -> durable webhook outbox -> webhook receiver
+```
+
+The browser/React process never opens a COM port or named pipe. `modemd` serializes AT access so health checks, SMS, uploads, calls, and unsolicited modem results do not interrupt one another. The service pipe rejects remote clients and is protected with a Windows ACL.
+
+### Main functional areas
+
+- **AT, hardware, and discovery** (`at.rs`, `hardware/`): validates guarded console commands, identifies the correct modem port, initializes it, frames command responses/prompts, separates unsolicited results, and performs interactive transfers with timeout recovery.
+- **SMS** (`sms.rs`, `windows_host/host/sms_workflow.rs`, `storage/sms.rs`): validates and encodes outbound SMS; tracks submission separately from handset delivery; parses GSM7/UCS2/PDU records and multipart messages. During synchronization it saves each inbound message or delivery report before deleting that exact modem storage slot.
+- **Audio and calls** (`audio.rs`, `call.rs`, `call_workflow/`, `storage/audio.rs`, `storage/calls.rs`): accepts only validated AMR-NB audio, uploads it in paced chunks, records duration and selection, then manages dialing, answered/ended calls, failures, and call history.
+- **Balance** (`windows_host/host/balance.rs`, `storage/balance.rs`): runs the configured USSD/balance workflow, parses the configured result where possible, and archives the check.
+- **Settings and storage** (`settings.rs`, `storage/`): validates modem and integration settings; stores settings, records, audio metadata, and integration outbox data in SQLite. Migrations preserve existing data.
+- **REST and webhooks** (`integration.rs`, `storage/integration.rs`): serves `POST /api/v1/communications` when enabled and supplied with a matching bearer token. `request_id` makes requests idempotent. REST-created SMS/calls create ordered lifecycle webhooks stored before delivery and retried until a 2xx response; redirects are not followed. Tokens are never returned through the pipe/UI or diagnostics.
+- **Windows host and simulator** (`windows_host.rs`, `modem-sim/`): the host runs as an SCM service or `--console` process, exposes the pipe API, starts the REST listener, and owns the database. The simulator implements compatible deterministic JSON/legacy replies for development; never run it on the same pipe as the service.
+
+## Build and test
+
+Run these commands from the repository root unless a command changes directory.
 
 ```powershell
+# Format verification and Rust compile/test suite
+cargo fmt --all --check
+cargo check --workspace
 cargo test --workspace
-cargo run -p modem-sim
+
+# Install UI dependencies once (or after package-lock changes)
 cd modem-app
 npm.cmd install
+
+# UI unit tests and production web build
+npm.cmd test
 npm.cmd run build
 ```
 
-On Windows the simulator listens on `\\.\pipe\a7670-modemd-v1`. Start it before `tauri dev`; the
-app then displays a simulated ready modem. It accepts a small deterministic line protocol used by
-the development UI, plus core AT commands for parser development without physical hardware.
+For formatting fixes during development, use `cargo fmt --all`. `npm.cmd` is used deliberately on Windows to avoid PowerShell command-resolution differences.
 
-## Architecture
+## Development and local diagnostics
 
-`modemd` is the sole serial-port owner. The intended production transport is tonic gRPC on
-`\\.\pipe\a7670-modemd-v1`; browser code never accesses IPC directly. `modem-proto` defines the
-versioned API, and the Tauri backend translates calls and events for React.
+### Run against the simulator
 
-Production data belongs under `%ProgramData%\A7670 Modem\` and must be ACLed to LocalService and
-administrators. Logs must redact phone numbers and exclude message bodies, audio, and unrestricted
-AT output. The service scripts require an elevated PowerShell and preserve ProgramData unless
-`uninstall-service.ps1 -PurgeData` is explicitly used.
+In terminal 1:
 
-The daemon treats modem SMS storage as a durable inbox queue. Synchronization commits every
-message and status report to SQLite before deleting those exact modem slots. This keeps a full `SM`
-store from blocking inbound SMS or stored delivery reports while preserving the application archive.
+```powershell
+cargo run -p modem-sim
+```
+
+In terminal 2:
+
+```powershell
+cd modem-app
+npm.cmd run tauri dev
+```
+
+The simulator listens on `\\.\pipe\a7670-modemd-v1`; start it before the app. It provides predictable status and request behavior but does not use physical hardware.
+
+### Run against a physical modem without installing the service
+
+First build the daemon, then use one of these read/development modes:
+
+```powershell
+cargo build -p modemd
+
+# List serial ports and attempt modem initialization; does not start the service.
+.\target\debug\modemd.exe --scan
+
+# Run the production named-pipe host interactively. Stop with Ctrl+C.
+.\target\debug\modemd.exe --console
+```
+
+Start the Tauri app only after `--console` is running. Do not start `modem-sim` or the installed service at the same time: all use the same pipe name.
+
+For low-level AMR troubleshooting, stop the service before running `scripts\diagnose-a7670-upload.ps1 -Port COMx`. That script intentionally leaves diagnostic files on the modem.
+
+## Release builds
+
+Build the service executable:
+
+```powershell
+cargo build -p modemd --release
+```
+
+The service executable is `target\release\modemd.exe`.
+
+Build the desktop installer:
+
+```powershell
+cd modem-app
+npm.cmd install
+npm.cmd run tauri build
+```
+
+This runs the frontend production build and creates the configured per-machine NSIS installer. Locate the generated `.exe` without relying on a Cargo target-layout detail:
+
+```powershell
+Get-ChildItem -Recurse -Filter "*setup*.exe" .\src-tauri\target, ..\target -ErrorAction SilentlyContinue
+```
+
+Before shipping, normally run the full verification sequence in **Build and test**, then build both release artifacts.
+
+## Deploy the service to another PC
+
+Build on a compatible Windows x64 build machine, then copy `target\release\modemd.exe` to the destination (or copy the entire source checkout and build there). On the destination, open **PowerShell as Administrator** and run:
+
+```powershell
+# If modemd.exe and install-service.ps1 were copied to C:\Install
+Set-Location C:\Install
+.\install-service.ps1 -Binary .\modemd.exe
+
+# Or, from a full source checkout after a local release build
+.\scripts\install-service.ps1
+```
+
+The installer script copies the binary to `C:\Program Files\A7670 Modem\modemd.exe`, creates or updates `A7670ModemService` under `NT AUTHORITY\LocalService`, configures delayed automatic startup and recovery restarts, and starts it. Runtime data is retained in `%ProgramData%\A7670 Modem\modemd.sqlite3` across upgrades.
+
+Verify the deployment:
+
+```powershell
+Get-Service A7670ModemService
+Test-Path "$env:ProgramData\A7670 Modem\modemd.sqlite3"
+```
+
+The second command confirms that the service created its SQLite data file; inspect its contents with a SQLite client. To stop/remove the service but retain data:
+
+```powershell
+.\scripts\uninstall-service.ps1
+```
+
+Use `.\scripts\uninstall-service.ps1 -PurgeData` only when intentionally deleting all local modem history, settings, audio metadata, REST communications, and pending webhook records.
+
+Deploy the desktop UI separately by running the generated NSIS installer as an administrator. The app can be installed on the same PC as the service and connects to its local pipe; it is not a remote client.
 
 ## REST and webhook integration
 
-The Windows service can expose `POST /api/v1/communications` on the configurable REST listener
-(default `0.0.0.0:5069`). REST is disabled by default and cannot be enabled until a bearer token has
-been stored on the Settings page. Requests support `sms` and `call` channels and immediate work
-only. Each request must include a non-empty opaque `request_id`; it is unique for duplicate
-prevention, while the daemon generates the UUID returned as `data.id`. The POST response also echoes
-`data.request_id` and uses `data.contact` for the normalized recipient. Call content is the
-case-insensitive name of an uploaded AMR-NB file; empty
-call content uses the currently selected AMR file and returns validation error if none is selected.
+The service optionally exposes `POST /api/v1/communications` on `0.0.0.0:5069` by default. Enable REST and set its bearer token through Settings; REST cannot be enabled without a token. It accepts immediate `sms` and `call` requests with a non-empty opaque `request_id` and replays the originally reserved communication for duplicate request IDs.
 
-Only REST-created communications produce lifecycle webhooks. Delivery uses a durable SQLite outbox,
-preserves event order for each communication, disables redirects, and retries until a 2xx response.
-The default receiver is `http://10.1.11.117:5068/api/v1/webhooks/receive`; its bearer token is
-configured separately and is never returned to the UI.
-Their payloads contain only the daemon `id`, caller `request_id`, and nullable `failure_reason`.
+Only REST-created communications create webhooks. Webhook payloads are deliberately minimal: event type plus `id`, `request_id`, and nullable `failure_reason`. This is intended for a firewall-restricted trusted LAN: HTTP does not protect bearer tokens or communication data in transit. Use network isolation or a TLS-terminating reverse proxy when needed. A REST bind-address change takes effect after restarting the service; other integration settings take effect immediately.
 
-This interface is intended only for a firewall-restricted, trusted LAN. Plain HTTP does not encrypt
-REST or webhook bearer tokens, phone numbers, or content in transit. Use network isolation or a TLS
-terminating reverse proxy when the LAN cannot be fully trusted. Changing the bind address requires a
-service restart; enablement, webhook URL, and token changes apply immediately.
+Set `MODEMD_INTEGRATION_DEBUG=1` in the service environment and restart it to enable short-lived sanitized Diagnostics data (at most 200 in-memory events). It never includes tokens, headers, phone numbers, message bodies, raw JSON/PDU, response text, or URL query values.
 
-### Integration diagnostics
+## Hardware acceptance notes
 
-For short-lived integration troubleshooting, set `MODEMD_INTEGRATION_DEBUG=1` in the service environment and restart the Windows service. The Diagnostics tab then refreshes sanitized REST and webhook activity every two seconds. It retains only the newest 200 events in daemon memory and clears them at restart; tokens, headers, phone numbers, message bodies, raw JSON, webhook response text, and URL query values are never shown.
-
-## Current implementation status
-
-Implemented: protobuf surface, byte-oriented framing including bare prompts, SMS/number limits,
-UCS2 encoding, audio signature/size checks, guarded AT validation, settings defaults/validation,
-Windows COM enumeration with VID/PID filtering, plug-and-play reconnect monitoring, AT-port
-probing and modem initialization,
-simulator responses, a Tauri navigation/dashboard shell, and service lifecycle scripts.
-
-Still required before production use: SCM control-handler integration, named-pipe server and DACL,
-serial command scheduling, SQLite migrations, complete feature state machines, Tauri command
-coverage, bundling the release daemon into NSIS with custom upgrade rollback, and security-context
-tests. The daemon is deliberately not declared as a Tauri resource yet, so `tauri dev` does not
-depend on a prebuilt `target/release/modemd.exe`.
-
-Physical acceptance is intentionally pending. With hardware, record actual composite COM
-interfaces and raw prompt bytes; confirm VID/PID and baud; tune upload pacing; then exercise SMS
-send/receive/delivery, USSD, answered and failed calls, remote audio, USB removal, and reconnect.
-
-For SMS delivery-report acceptance, record the A7670 model, COM port, `ATI`, `AT+CGMR`,
-`AT+CNMI=?`, `AT+CNMI?`, `AT+CSMP?`, and `AT+CPMS?`. Test reachable and unreachable recipients,
-daemon restart and application closure before the receipt, a receipt arriving during a call, and
-TP-MR reuse. A missing carrier receipt is not a delivery failure. When delivery tracking was
-verified, a submitted message remains Delivery pending for the `AT+CSMP=49,167,0,0` 24-hour
-validity period, then becomes Delivery unknown if no terminal report arrives. A late terminal
-report must still replace Delivery unknown. Confirm that an airplane-mode recipient releases Send
-as soon as `+CMGS` and `OK` arrive; submission must never wait for handset delivery. If the modem
-provides no final submission result within 40 seconds, the operation must finish as Send result
-unknown.
+Before production rollout, record the A7670 model, COM port, `ATI`, `AT+CGMR`, and the raw behavior of relevant commands/prompts. For delivery reports also record `AT+CNMI=?`, `AT+CNMI?`, `AT+CSMP?`, and `AT+CPMS?`; test reachable/unreachable recipients, a service restart before receipt, a receipt during a call, and message-reference reuse. See [a7670c-sms-send-delivery-status.md](a7670c-sms-send-delivery-status.md) and [a7670c-automation-plan (2).md](a7670c-automation-plan%20(2).md) for the acceptance context.
