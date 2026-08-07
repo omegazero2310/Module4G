@@ -149,7 +149,7 @@ impl Store {
         connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS integration_settings(id INTEGER PRIMARY KEY CHECK(id=1),json TEXT NOT NULL,updated_at_ms INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS rest_communications(
-               id TEXT PRIMARY KEY,record_id TEXT NOT NULL UNIQUE,channel TEXT NOT NULL,owner TEXT NOT NULL,
+               id TEXT PRIMARY KEY,request_id TEXT NOT NULL UNIQUE,record_id TEXT NOT NULL UNIQUE,channel TEXT NOT NULL,owner TEXT NOT NULL,
                destination TEXT NOT NULL,content TEXT NOT NULL,encrypted INTEGER NOT NULL,
                payload_fingerprint TEXT NOT NULL,status TEXT NOT NULL,created_at_ms INTEGER NOT NULL,
                sent_at_ms INTEGER,delivered_at_ms INTEGER,failed_at_ms INTEGER,failure_reason TEXT NOT NULL DEFAULT '');
@@ -161,6 +161,20 @@ impl Store {
                FOREIGN KEY(communication_id) REFERENCES rest_communications(id));
              CREATE INDEX IF NOT EXISTS webhook_outbox_due ON webhook_outbox(completed_at_ms,next_attempt_at_ms,id);
              INSERT OR IGNORE INTO schema_migrations(version) VALUES (9);",
+        ).map_err(db_error)?;
+        let rest_columns = table_columns(&connection, "rest_communications")?;
+        if !rest_columns.iter().any(|column| column == "request_id") {
+            connection
+                .execute(
+                    "ALTER TABLE rest_communications ADD COLUMN request_id TEXT NOT NULL DEFAULT ''",
+                    [],
+                )
+                .map_err(db_error)?;
+        }
+        connection.execute_batch(
+            "UPDATE rest_communications SET request_id=id WHERE request_id='';
+             CREATE UNIQUE INDEX IF NOT EXISTS rest_communications_request_id ON rest_communications(request_id);
+             INSERT OR IGNORE INTO schema_migrations(version) VALUES (10);",
         ).map_err(db_error)?;
         Ok(())
     }

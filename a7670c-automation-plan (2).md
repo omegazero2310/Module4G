@@ -18,8 +18,10 @@ Manual verified against: `A76XX-Series_AT_Command_Manual_V1_06-4.pdf`
 
 **LAN integration:** `modemd` also provides an optional authenticated HTTP adapter for immediate
 SMS and call requests. It invokes the same serialized daemon workflows and never opens the serial
-port independently. REST UUIDs, normalized lifecycle state, and an ordered webhook retry outbox are
-persisted in SQLite. Only REST-created outbound communications emit webhooks. The adapter is disabled
+port independently. REST callers provide a non-empty opaque request ID for duplicate prevention; the
+daemon persists it separately from its generated UUID communication ID. Normalized lifecycle state and
+an ordered webhook retry outbox are persisted in SQLite. Webhook data contains only the daemon ID,
+caller request ID, and nullable failure reason. Only REST-created outbound communications emit webhooks. The adapter is disabled
 until a bearer token is stored; plain HTTP deployments must remain on a firewall-restricted trusted
 LAN because bearer tokens and communication content are not encrypted in transit.
 

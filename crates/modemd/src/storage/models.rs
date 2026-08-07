@@ -105,6 +105,7 @@ impl Default for IntegrationSettings {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RestCommunication {
     pub id: String,
+    pub request_id: String,
     pub record_id: String,
     pub channel: String,
     pub owner: String,
@@ -133,6 +134,5 @@ pub struct WebhookAttempt {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommunicationReservation {
     New(RestCommunication),
-    Replay(RestCommunication),
     Conflict,
 }

@@ -48,7 +48,7 @@ impl From<&IntegrationSettings> for PublicIntegrationSettings {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommunicationRequest {
-    pub request_id: Option<String>,
+    pub request_id: String,
     #[serde(rename = "from")]
     pub owner: String,
     pub to: String,
@@ -79,8 +79,9 @@ impl Channel {
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct CommunicationData {
     pub id: String,
+    pub request_id: String,
     pub owner: String,
-    pub to: String,
+    pub contact: String,
     pub channel: String,
     pub content: String,
     pub encrypted: bool,
@@ -103,7 +104,14 @@ pub struct HttpSmsEnvelope<T> {
 pub struct CommunicationWebhookRequest {
     #[serde(rename = "type")]
     pub event_type: String,
-    pub data: CommunicationData,
+    pub data: CommunicationWebhookData,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct CommunicationWebhookData {
+    pub id: String,
+    pub request_id: String,
+    pub failure_reason: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -206,17 +214,13 @@ async fn process_request(
             "future send_at values are not supported".into(),
         ));
     }
-    let id = match request.request_id {
-        Some(value) => uuid::Uuid::parse_str(&value)
-            .map_err(|_| {
-                (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "request_id must be a UUID".into(),
-                )
-            })?
-            .to_string(),
-        None => uuid::Uuid::new_v4().to_string(),
-    };
+    if request.request_id.is_empty() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "request_id must be a non-empty string".into(),
+        ));
+    }
+    let id = uuid::Uuid::new_v4().to_string();
     let destination = match request.channel {
         Channel::Sms => crate::sms::normalize_sms_destination(&request.to),
         Channel::Call => crate::sms::normalize_call_destination(&request.to),
@@ -259,6 +263,7 @@ async fn process_request(
     let stamp = now_ms();
     let communication = RestCommunication {
         id: id.clone(),
+        request_id: request.request_id,
         record_id: id.clone(),
         channel: request.channel.as_str().into(),
         owner: request.owner,
@@ -276,13 +281,7 @@ async fn process_request(
         .map_err(internal)?
     {
         CommunicationReservation::Conflict => {
-            return Err((
-                StatusCode::CONFLICT,
-                "request_id was already used with a different payload".into(),
-            ));
-        }
-        CommunicationReservation::Replay(existing) => {
-            return Ok((StatusCode::OK, communication_data(&existing), true));
+            return Err((StatusCode::CONFLICT, "request_id was already used".into()));
         }
         CommunicationReservation::New(_) => {}
     }
@@ -448,7 +447,15 @@ pub fn webhook_payload(
 ) -> Result<String, ModemError> {
     serde_json::to_string(&CommunicationWebhookRequest {
         event_type: event_type.into(),
-        data: communication_data(communication),
+        data: CommunicationWebhookData {
+            id: communication.id.clone(),
+            request_id: communication.request_id.clone(),
+            failure_reason: matches!(
+                event_type,
+                "communication.failed" | "communication.expired" | "communication.missed"
+            )
+            .then(|| communication.failure_reason.clone()),
+        },
     })
     .map_err(|e| ModemError::Persistence(e.to_string()))
 }
@@ -498,8 +505,9 @@ fn timestamp(ms: i64) -> Option<String> {
 pub fn communication_data(value: &RestCommunication) -> CommunicationData {
     CommunicationData {
         id: value.id.clone(),
+        request_id: value.request_id.clone(),
         owner: value.owner.clone(),
-        to: value.destination.clone(),
+        contact: value.destination.clone(),
         channel: value.channel.clone(),
         content: value.content.clone(),
         encrypted: value.encrypted,
@@ -684,9 +692,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uuid_is_idempotent_and_conflicts_on_changed_payload() {
+    async fn request_id_is_opaque_and_duplicates_are_rejected_without_redispatch() {
         let (app, dispatcher) = fixture();
-        let id = "d2719dd7-246b-4e20-9c17-d40f0567b217";
+        let id = "caller-correlation/42";
         let payload = serde_json::json!({"request_id":id,"from":"desk","to":"0912345678","channel":"sms","content":"hello","encrypted":true,"send_at":null});
         let response = app
             .clone()
@@ -698,7 +706,12 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["data"]["id"], id);
+        let daemon_id = json["data"]["id"].as_str().unwrap();
+        assert!(uuid::Uuid::parse_str(daemon_id).is_ok());
+        assert_ne!(daemon_id, id);
+        assert_eq!(json["data"]["request_id"], id);
+        assert_eq!(json["data"]["contact"], "+84912345678");
+        assert!(json["data"].get("to").is_none());
         assert_eq!(json["data"]["status"], "sent");
         assert!(json["data"]["created_at"].as_str().unwrap().ends_with('Z'));
         assert!(json["data"].get("createdAt").is_none());
@@ -708,7 +721,7 @@ mod tests {
                 .await
                 .unwrap()
                 .status(),
-            StatusCode::OK
+            StatusCode::CONFLICT
         );
         assert_eq!(dispatcher.sends.load(Ordering::SeqCst), 1);
         let conflict = serde_json::json!({"request_id":id,"from":"desk","to":"0912345678","channel":"sms","content":"different"});
@@ -719,12 +732,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_invalid_uuid_future_work_and_unknown_channel() {
+    async fn requires_non_empty_request_id_and_rejects_future_work_and_unknown_channel() {
         let (app, _) = fixture();
         for payload in [
-            serde_json::json!({"request_id":"bad","from":"desk","to":"0912345678","channel":"sms","content":"hello"}),
-            serde_json::json!({"from":"desk","to":"0912345678","channel":"email","content":"hello"}),
-            serde_json::json!({"from":"desk","to":"0912345678","channel":"sms","content":"hello","send_at":"2999-01-01T00:00:00Z"}),
+            serde_json::json!({"from":"desk","to":"0912345678","channel":"sms","content":"hello"}),
+            serde_json::json!({"request_id":"","from":"desk","to":"0912345678","channel":"sms","content":"hello"}),
+            serde_json::json!({"request_id":"request-2","from":"desk","to":"0912345678","channel":"email","content":"hello"}),
+            serde_json::json!({"request_id":"request-3","from":"desk","to":"0912345678","channel":"sms","content":"hello","send_at":"2999-01-01T00:00:00Z"}),
         ] {
             assert_eq!(
                 app.clone()
@@ -756,7 +770,7 @@ mod tests {
             .unwrap();
         let response = app
             .oneshot(request(
-                serde_json::json!({"from":"desk","to":"0912345678","channel":"call","content":""}),
+                serde_json::json!({"request_id":"call-request","from":"desk","to":"0912345678","channel":"call","content":""}),
                 true,
             ))
             .await
@@ -790,12 +804,38 @@ mod tests {
     }
 
     #[test]
+    fn webhook_payload_uses_only_contract_fields_and_nullable_failure_reason() {
+        let communication = RestCommunication {
+            id: "daemon-id".into(),
+            request_id: "external-id".into(),
+            failure_reason: "not answered".into(),
+            ..Default::default()
+        };
+        for (event_type, reason) in [
+            ("communication.sent", serde_json::Value::Null),
+            ("communication.delivered", serde_json::Value::Null),
+            ("communication.failed", serde_json::json!("not answered")),
+            ("communication.expired", serde_json::json!("not answered")),
+            ("communication.missed", serde_json::json!("not answered")),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(
+                    &webhook_payload(&communication, event_type).unwrap()
+                )
+                .unwrap(),
+                serde_json::json!({"type":event_type,"data":{"id":"daemon-id","request_id":"external-id","failure_reason":reason}})
+            );
+        }
+    }
+
+    #[test]
     fn outbox_preserves_order_and_late_delivery_replaces_expiration() {
         let store = Store::memory().unwrap();
         let id = "bf63c10f-8085-4748-ae06-c8238c604f03";
         store
             .reserve_rest_communication(&RestCommunication {
                 id: id.into(),
+                request_id: "external-request".into(),
                 record_id: id.into(),
                 channel: "sms".into(),
                 owner: "desk".into(),
@@ -821,6 +861,10 @@ mod tests {
         store.reconcile_rest_communications(2).unwrap();
         let sent = store.next_webhook(2).unwrap().unwrap();
         assert_eq!(sent.event_type, "communication.sent");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&sent.payload).unwrap(),
+            serde_json::json!({"type":"communication.sent","data":{"id":id,"request_id":"external-request","failure_reason":null}})
+        );
         sms.state = "delivery-unknown".into();
         sms.cause = "timeout".into();
         store.save_sms(&sms).unwrap();
@@ -829,6 +873,10 @@ mod tests {
         store.complete_webhook(sent.id, 3).unwrap();
         let expired = store.next_webhook(3).unwrap().unwrap();
         assert_eq!(expired.event_type, "communication.expired");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&expired.payload).unwrap()["data"]["failure_reason"],
+            "timeout"
+        );
         sms.state = "delivered".into();
         sms.cause.clear();
         store.save_sms(&sms).unwrap();

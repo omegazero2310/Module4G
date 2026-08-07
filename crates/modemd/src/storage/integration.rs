@@ -39,23 +39,20 @@ impl Store {
     ) -> Result<CommunicationReservation, ModemError> {
         let connection = self.connection()?;
         let inserted = connection.execute(
-            "INSERT OR IGNORE INTO rest_communications(id,record_id,channel,owner,destination,content,encrypted,payload_fingerprint,status,created_at_ms)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-            params![communication.id,communication.record_id,communication.channel,communication.owner,
+            "INSERT OR IGNORE INTO rest_communications(id,request_id,record_id,channel,owner,destination,content,encrypted,payload_fingerprint,status,created_at_ms)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            params![communication.id,communication.request_id,communication.record_id,communication.channel,communication.owner,
                 communication.destination,communication.content,communication.encrypted,
                 communication.payload_fingerprint,communication.status,communication.created_at_ms],
         ).map_err(db_error)?;
         if inserted == 1 {
             return Ok(CommunicationReservation::New(communication.clone()));
         }
-        let existing = communication_by_id(&connection, &communication.id)?.ok_or_else(|| {
-            ModemError::Persistence("communication reservation disappeared".into())
-        })?;
-        if existing.payload_fingerprint == communication.payload_fingerprint {
-            Ok(CommunicationReservation::Replay(existing))
-        } else {
-            Ok(CommunicationReservation::Conflict)
-        }
+        let _existing = communication_by_request_id(&connection, &communication.request_id)?
+            .ok_or_else(|| {
+                ModemError::Persistence("communication reservation disappeared".into())
+            })?;
+        Ok(CommunicationReservation::Conflict)
     }
 
     pub fn rest_communication(&self, id: &str) -> Result<Option<RestCommunication>, ModemError> {
@@ -67,7 +64,7 @@ impl Store {
         let mut connection = self.connection()?;
         let transaction = connection.transaction().map_err(db_error)?;
         let mut statement = transaction.prepare(
-            "SELECT r.id,r.record_id,r.channel,r.owner,r.destination,r.content,r.encrypted,
+            "SELECT r.id,r.request_id,r.record_id,r.channel,r.owner,r.destination,r.content,r.encrypted,
                     r.payload_fingerprint,r.status,r.created_at_ms,COALESCE(r.sent_at_ms,0),
                     COALESCE(r.delivered_at_ms,0),COALESCE(r.failed_at_ms,0),r.failure_reason,
                     CASE WHEN r.channel='sms' THEN COALESCE(s.state,'') ELSE COALESCE(c.state,'') END,
@@ -83,12 +80,12 @@ impl Store {
             .query_map([], |row| {
                 Ok((
                     communication_from_row(row)?,
-                    row.get::<_, String>(14)?,
                     row.get::<_, String>(15)?,
                     row.get::<_, String>(16)?,
                     row.get::<_, String>(17)?,
-                    row.get::<_, i64>(18)?,
+                    row.get::<_, String>(18)?,
                     row.get::<_, i64>(19)?,
+                    row.get::<_, i64>(20)?,
                 ))
             })
             .map_err(db_error)?
@@ -209,27 +206,39 @@ fn communication_by_id(
     id: &str,
 ) -> Result<Option<RestCommunication>, ModemError> {
     connection.query_row(
-        "SELECT id,record_id,channel,owner,destination,content,encrypted,payload_fingerprint,status,created_at_ms,
+        "SELECT id,request_id,record_id,channel,owner,destination,content,encrypted,payload_fingerprint,status,created_at_ms,
                 COALESCE(sent_at_ms,0),COALESCE(delivered_at_ms,0),COALESCE(failed_at_ms,0),failure_reason
          FROM rest_communications WHERE id=?1", [id], communication_from_row,
+    ).optional().map_err(db_error)
+}
+
+fn communication_by_request_id(
+    connection: &Connection,
+    request_id: &str,
+) -> Result<Option<RestCommunication>, ModemError> {
+    connection.query_row(
+        "SELECT id,request_id,record_id,channel,owner,destination,content,encrypted,payload_fingerprint,status,created_at_ms,
+                COALESCE(sent_at_ms,0),COALESCE(delivered_at_ms,0),COALESCE(failed_at_ms,0),failure_reason
+         FROM rest_communications WHERE request_id=?1", [request_id], communication_from_row,
     ).optional().map_err(db_error)
 }
 
 fn communication_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RestCommunication> {
     Ok(RestCommunication {
         id: row.get(0)?,
-        record_id: row.get(1)?,
-        channel: row.get(2)?,
-        owner: row.get(3)?,
-        destination: row.get(4)?,
-        content: row.get(5)?,
-        encrypted: row.get(6)?,
-        payload_fingerprint: row.get(7)?,
-        status: row.get(8)?,
-        created_at_ms: row.get(9)?,
-        sent_at_ms: row.get(10)?,
-        delivered_at_ms: row.get(11)?,
-        failed_at_ms: row.get(12)?,
-        failure_reason: row.get(13)?,
+        request_id: row.get(1)?,
+        record_id: row.get(2)?,
+        channel: row.get(3)?,
+        owner: row.get(4)?,
+        destination: row.get(5)?,
+        content: row.get(6)?,
+        encrypted: row.get(7)?,
+        payload_fingerprint: row.get(8)?,
+        status: row.get(9)?,
+        created_at_ms: row.get(10)?,
+        sent_at_ms: row.get(11)?,
+        delivered_at_ms: row.get(12)?,
+        failed_at_ms: row.get(13)?,
+        failure_reason: row.get(14)?,
     })
 }

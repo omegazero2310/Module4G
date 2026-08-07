@@ -97,7 +97,7 @@ mod tests {
     #[test]
     fn migrates_and_round_trips_settings() {
         let store = Store::memory().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 9);
+        assert_eq!(store.schema_version().unwrap(), 10);
         let mut expected = Settings::default();
         expected.port_override = Some("COM6".into());
         store.save_settings(&expected, 42).unwrap();
@@ -248,6 +248,53 @@ mod tests {
         assert_eq!(store.list_balances(10).unwrap()[0].sms_id, "");
         assert_eq!(store.list_calls(10).unwrap().len(), 1);
         assert_eq!(store.list_audio().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn request_id_migration_backfills_communications_and_preserves_outbox() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(
+            "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY);
+             INSERT INTO schema_migrations(version) VALUES(9);
+             CREATE TABLE rest_communications(
+               id TEXT PRIMARY KEY,record_id TEXT NOT NULL UNIQUE,channel TEXT NOT NULL,owner TEXT NOT NULL,
+               destination TEXT NOT NULL,content TEXT NOT NULL,encrypted INTEGER NOT NULL,
+               payload_fingerprint TEXT NOT NULL,status TEXT NOT NULL,created_at_ms INTEGER NOT NULL,
+               sent_at_ms INTEGER,delivered_at_ms INTEGER,failed_at_ms INTEGER,failure_reason TEXT NOT NULL DEFAULT '');
+             CREATE TABLE webhook_outbox(
+               id INTEGER PRIMARY KEY AUTOINCREMENT,communication_id TEXT NOT NULL,event_type TEXT NOT NULL,
+               payload TEXT NOT NULL,attempt_count INTEGER NOT NULL DEFAULT 0,next_attempt_at_ms INTEGER NOT NULL,
+               last_error TEXT NOT NULL DEFAULT '',completed_at_ms INTEGER,
+               UNIQUE(communication_id,event_type));
+             INSERT INTO rest_communications(id,record_id,channel,owner,destination,content,encrypted,payload_fingerprint,status,created_at_ms)
+               VALUES('old-id','old-id','sms','desk','+84912345678','hello',0,'fp','sent',1);
+             INSERT INTO webhook_outbox(communication_id,event_type,payload,next_attempt_at_ms)
+               VALUES('old-id','communication.sent','{}',1);",
+        ).unwrap();
+        let store = Store(Mutex::new(connection));
+        store.migrate().unwrap();
+        assert_eq!(store.schema_version().unwrap(), 10);
+        assert_eq!(
+            store
+                .connection()
+                .unwrap()
+                .query_row(
+                    "SELECT request_id FROM rest_communications WHERE id='old-id'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "old-id"
+        );
+        assert_eq!(
+            store
+                .connection()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM webhook_outbox", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
     #[test]
     fn balance_links_sms() {
