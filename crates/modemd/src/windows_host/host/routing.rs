@@ -11,6 +11,7 @@ pub(super) async fn handle_client(
     let store = Arc::clone(&context.store);
     let call_manager = Arc::clone(&context.call_manager);
     let integration_settings = Arc::clone(&context.integration_settings);
+    let integration_diagnostics = Arc::clone(&context.integration_diagnostics);
     let mut stream = BufReader::new(server);
     let mut line = String::new();
     while stream.read_line(&mut line).await? != 0 {
@@ -24,6 +25,7 @@ pub(super) async fn handle_client(
                 &delivery_capability,
                 &delivery_configuration,
                 &integration_settings,
+                &integration_diagnostics,
             )
             .await
         } else if request == "STATUS" {
@@ -128,6 +130,7 @@ pub(super) async fn handle_json(
     delivery_capability: &Arc<RwLock<DeliveryCapability>>,
     delivery_configuration: &Arc<tokio::sync::Mutex<()>>,
     integration_settings: &Arc<RwLock<IntegrationSettings>>,
+    integration_diagnostics: &Arc<modemd::integration::IntegrationDiagnostics>,
 ) -> String {
     let value: serde_json::Value = match serde_json::from_str(request) {
         Ok(v) => v,
@@ -238,6 +241,9 @@ pub(super) async fn handle_json(
             ),
         )
         .unwrap()),
+        "list_integration_diagnostics" => {
+            Ok(serde_json::to_value(integration_diagnostics.snapshot()).unwrap())
+        }
         "update_integration_settings" => {
             update_integration_settings(&value, store, integration_settings)
                 .map(|settings| serde_json::to_value(settings).unwrap())

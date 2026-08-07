@@ -28,6 +28,8 @@ LAN because bearer tokens and communication content are not encrypted in transit
 For REST calls, a non-empty `content` selects an uploaded AMR file by case-insensitive filename.
 Empty or whitespace-only `content` uses the currently selected AMR file.
 
+**Integration diagnostics:** Set `MODEMD_INTEGRATION_DEBUG=1` before starting or restarting the daemon to enable an in-memory, sanitized 200-event REST/webhook activity history. The app's Diagnostics tab refreshes this history every two seconds. It is intended for troubleshooting only and never stores or displays credentials, headers, phone numbers, message content, raw JSON, webhook response bodies, or URL query values.
+
 ## 2. Language choice
 
 **Daemon: Rust.**

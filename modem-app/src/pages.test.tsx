@@ -1,8 +1,8 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { Calls, SettingsPage, Sms } from "./pages";
-import type { Record, Settings } from "./types";
+import { Calls, Diagnostics, SettingsPage, Sms } from "./pages";
+import type { Record, Settings, Status } from "./types";
 
 const invokeMock = vi.fn();
 vi.mock("./api", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
@@ -50,6 +50,33 @@ describe("Calls page", () => {
     expect(screen.getByText("Select an AMR-NB file with an .amr extension.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Dial" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Hang Up" })).toBeDisabled();
+  });
+});
+
+describe("Diagnostics page", () => {
+  const status = { state: "Ready" } as Status;
+
+  it("loads integration activity, refreshes it, and clears the interval on unmount", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    invokeMock.mockImplementation((command: string) => command === "list_integration_diagnostics" ? Promise.resolve([{ timestamp: "2026-01-01T01:02:03.000Z", source: "api", phase: "response", outcome: "success", httpStatus: 201, requestId: "request-1", communicationId: "id-1", elapsedMs: 7, summary: "REST communication processed" }]) : Promise.resolve([]));
+    const view = render(<Diagnostics status={status}/>);
+    expect(await screen.findByText("REST communication processed")).toBeInTheDocument();
+    expect(screen.getByText("request-1 / id-1")).toBeInTheDocument();
+    fireEvent.click(within(view.container).getAllByRole("button", { name: "Refresh" })[1]);
+    expect(invokeMock.mock.calls.filter(([command]) => command === "list_integration_diagnostics")).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(invokeMock.mock.calls.filter(([command]) => command === "list_integration_diagnostics")).toHaveLength(3);
+    view.unmount();
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(invokeMock.mock.calls.filter(([command]) => command === "list_integration_diagnostics")).toHaveLength(3);
+    vi.useRealTimers();
+  });
+
+  it("explains the empty disabled-capture state", async () => {
+    invokeMock.mockResolvedValue([]);
+    const view = render(<Diagnostics status={status}/>);
+    expect(await within(view.container).findByText(/No integration activity captured/)).toBeInTheDocument();
+    expect(within(view.container).getAllByText(/MODEMD_INTEGRATION_DEBUG=1/)).not.toHaveLength(0);
   });
 });
 

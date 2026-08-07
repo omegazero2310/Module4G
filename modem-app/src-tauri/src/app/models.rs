@@ -60,6 +60,23 @@ pub(super) struct IntegrationSettings {
     pub(super) clear_webhook_token: bool,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct IntegrationDiagnosticEvent {
+    pub(super) timestamp: String,
+    pub(super) source: String,
+    pub(super) phase: String,
+    pub(super) outcome: String,
+    pub(super) http_status: Option<u16>,
+    pub(super) request_id: Option<String>,
+    pub(super) communication_id: Option<String>,
+    pub(super) channel: Option<String>,
+    pub(super) byte_count: Option<usize>,
+    pub(super) payload_sha256: Option<String>,
+    pub(super) elapsed_ms: Option<u128>,
+    pub(super) summary: String,
+}
+
 impl Default for IntegrationSettings {
     fn default() -> Self {
         Self {

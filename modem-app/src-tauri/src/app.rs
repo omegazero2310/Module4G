@@ -100,6 +100,7 @@ pub fn run() {
             settings_handlers::list_ports,
             integration_handlers::get_integration_settings,
             integration_handlers::update_integration_settings,
+            integration_handlers::list_integration_diagnostics,
             console::execute_at,
             sms_handlers::send_sms,
             sms_handlers::sync_sms,

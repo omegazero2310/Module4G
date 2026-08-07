@@ -68,6 +68,7 @@ pub mod host {
         store: Arc<Store>,
         call_manager: Arc<CallManager>,
         integration_settings: Arc<RwLock<IntegrationSettings>>,
+        integration_diagnostics: Arc<integration::IntegrationDiagnostics>,
     }
 
     define_windows_service!(ffi_service_main, service_main);
@@ -175,6 +176,13 @@ pub mod host {
                 .load_integration_settings()
                 .map_err(io::Error::other)?,
         ));
+        let integration_diagnostics =
+            Arc::new(integration::IntegrationDiagnostics::from_environment());
+        if integration_diagnostics.enabled() {
+            eprintln!(
+                "integration diagnostics enabled; retaining the latest 200 sanitized events in memory"
+            );
+        }
         let device_state = Arc::new(RwLock::new(hardware::HardwareState::Disconnected));
         let delivery_capability = Arc::new(RwLock::new(DeliveryCapability::default()));
         let delivery_configuration = Arc::new(tokio::sync::Mutex::new(()));
@@ -227,6 +235,7 @@ pub mod host {
             store: Arc::clone(&store),
             call_manager: Arc::clone(&call_manager),
             integration_settings: Arc::clone(&integration_settings),
+            integration_diagnostics: Arc::clone(&integration_diagnostics),
         });
         let rest_dispatcher: Arc<dyn CommunicationDispatcher> = Arc::new(HostDispatcher {
             command_tx: command_tx.clone(),
@@ -239,6 +248,7 @@ pub mod host {
             store: Arc::clone(&store),
             settings: Arc::clone(&integration_settings),
             dispatcher: rest_dispatcher,
+            diagnostics: Arc::clone(&integration_diagnostics),
         };
         let bind_address = integration_settings
             .read()
@@ -264,6 +274,7 @@ pub mod host {
         let webhook_worker = tokio::spawn(integration::deliver_webhooks(
             Arc::clone(&store),
             Arc::clone(&integration_settings),
+            Arc::clone(&integration_diagnostics),
         ));
         let sync_tx = command_tx.clone();
         let sync_store = Arc::clone(&store);

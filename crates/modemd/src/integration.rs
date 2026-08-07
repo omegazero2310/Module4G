@@ -15,13 +15,116 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::VecDeque,
     net::SocketAddr,
-    sync::{Arc, RwLock},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{Arc, Mutex, RwLock},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 pub const DEFAULT_WEBHOOK_URL: &str = "http://10.1.11.117:5068/api/v1/webhooks/receive";
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
+pub const INTEGRATION_DIAGNOSTICS_CAPACITY: usize = 200;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IntegrationDiagnosticEvent {
+    pub timestamp: String,
+    pub source: String,
+    pub phase: String,
+    pub outcome: String,
+    pub http_status: Option<u16>,
+    pub request_id: Option<String>,
+    pub communication_id: Option<String>,
+    pub channel: Option<String>,
+    pub byte_count: Option<usize>,
+    pub payload_sha256: Option<String>,
+    pub elapsed_ms: Option<u128>,
+    pub summary: String,
+}
+
+#[derive(Debug)]
+pub struct IntegrationDiagnostics {
+    enabled: bool,
+    events: Mutex<VecDeque<IntegrationDiagnosticEvent>>,
+}
+
+impl IntegrationDiagnostics {
+    pub fn from_environment() -> Self {
+        Self::new(matches!(std::env::var("MODEMD_INTEGRATION_DEBUG"), Ok(value) if value == "1"))
+    }
+
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            events: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn record(&self, event: IntegrationDiagnosticEvent) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!(
+            "integration diagnostic: {} {} {} {}",
+            event.source, event.phase, event.outcome, event.summary
+        );
+        let mut events = self.events.lock().unwrap_or_else(|lock| lock.into_inner());
+        if events.len() == INTEGRATION_DIAGNOSTICS_CAPACITY {
+            events.pop_front();
+        }
+        events.push_back(event);
+    }
+
+    pub fn snapshot(&self) -> Vec<IntegrationDiagnosticEvent> {
+        if !self.enabled {
+            return Vec::new();
+        }
+        self.events
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .iter()
+            .rev()
+            .cloned()
+            .collect()
+    }
+}
+
+fn diagnostic_event(
+    source: &str,
+    phase: &str,
+    outcome: &str,
+    http_status: Option<u16>,
+    request_id: Option<String>,
+    communication_id: Option<String>,
+    channel: Option<String>,
+    byte_count: Option<usize>,
+    payload_sha256: Option<String>,
+    elapsed_ms: Option<u128>,
+    summary: &str,
+) -> IntegrationDiagnosticEvent {
+    IntegrationDiagnosticEvent {
+        timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        source: source.into(),
+        phase: phase.into(),
+        outcome: outcome.into(),
+        http_status,
+        request_id,
+        communication_id,
+        channel,
+        byte_count,
+        payload_sha256,
+        elapsed_ms,
+        summary: summary.into(),
+    }
+}
+
+fn payload_sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -100,14 +203,14 @@ pub struct HttpSmsEnvelope<T> {
     pub data: Option<T>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CommunicationWebhookRequest {
     #[serde(rename = "type")]
     pub event_type: String,
     pub data: CommunicationWebhookData,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommunicationWebhookData {
     pub id: String,
     pub request_id: String,
@@ -142,6 +245,7 @@ pub struct RestState {
     pub store: Arc<Store>,
     pub settings: Arc<RwLock<IntegrationSettings>>,
     pub dispatcher: Arc<dyn CommunicationDispatcher>,
+    pub diagnostics: Arc<IntegrationDiagnostics>,
 }
 
 pub fn router(state: RestState) -> Router {
@@ -160,6 +264,7 @@ async fn post_communication(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    let started = Instant::now();
     let settings = state
         .settings
         .read()
@@ -169,12 +274,68 @@ async fn post_communication(
         || settings.rest_token.is_empty()
         || !authorized(&headers, &settings.rest_token)
     {
+        state.diagnostics.record(diagnostic_event(
+            "api",
+            "request",
+            "received",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "REST communication request received",
+        ));
+        state.diagnostics.record(diagnostic_event(
+            "api",
+            "response",
+            "authentication-failed",
+            Some(StatusCode::UNAUTHORIZED.as_u16()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(started.elapsed().as_millis()),
+            "REST authentication rejected",
+        ));
         return error(StatusCode::UNAUTHORIZED, "authentication required");
     }
     let bytes = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
         Ok(bytes) => bytes,
-        Err(_) => return error(StatusCode::PAYLOAD_TOO_LARGE, "request body exceeds 64 KiB"),
+        Err(_) => {
+            state.diagnostics.record(diagnostic_event(
+                "api",
+                "request",
+                "received",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "REST communication request received",
+            ));
+            state.diagnostics.record(diagnostic_event(
+                "api",
+                "response",
+                "payload-too-large",
+                Some(StatusCode::PAYLOAD_TOO_LARGE.as_u16()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(started.elapsed().as_millis()),
+                "REST request exceeded the body limit",
+            ));
+            return error(StatusCode::PAYLOAD_TOO_LARGE, "request body exceeds 64 KiB");
+        }
     };
+    let byte_count = bytes.len();
+    let hash = payload_sha256(&bytes);
     let request: CommunicationRequest = match serde_json::from_slice(&bytes) {
         Ok(value) => value,
         Err(parse_error) => {
@@ -183,24 +344,105 @@ async fn post_communication(
             } else {
                 StatusCode::BAD_REQUEST
             };
+            state.diagnostics.record(diagnostic_event(
+                "api",
+                "request",
+                "received",
+                None,
+                None,
+                None,
+                None,
+                Some(byte_count),
+                Some(hash.clone()),
+                None,
+                "REST communication request received",
+            ));
+            state.diagnostics.record(diagnostic_event(
+                "api",
+                "response",
+                "invalid-json",
+                Some(status.as_u16()),
+                None,
+                None,
+                None,
+                Some(byte_count),
+                Some(hash),
+                Some(started.elapsed().as_millis()),
+                "REST request JSON was rejected",
+            ));
             return error(status, "invalid JSON request");
         }
     };
+    let request_id = request.request_id.clone();
+    let channel = request.channel.as_str().to_owned();
+    state.diagnostics.record(diagnostic_event(
+        "api",
+        "request",
+        "received",
+        None,
+        Some(request_id.clone()),
+        None,
+        Some(channel.clone()),
+        Some(byte_count),
+        Some(hash),
+        None,
+        "REST communication request received",
+    ));
     match process_request(&state, request).await {
-        Ok((status, data, replay)) => (
-            status,
-            Json(HttpSmsEnvelope {
-                status: "success".into(),
-                message: if replay {
-                    "communication already exists".into()
-                } else {
-                    "communication processed".into()
-                },
-                data: Some(data),
-            }),
-        )
-            .into_response(),
-        Err((status, message)) => error(status, &message),
+        Ok((status, data, replay)) => {
+            let outcome = if data.status == "failed" {
+                "dispatch-failed"
+            } else {
+                "success"
+            };
+            let summary = if data.status == "failed" {
+                "REST communication dispatch failed"
+            } else {
+                "REST communication processed"
+            };
+            state.diagnostics.record(diagnostic_event(
+                "api",
+                "response",
+                outcome,
+                Some(status.as_u16()),
+                Some(data.request_id.clone()),
+                Some(data.id.clone()),
+                Some(data.channel.clone()),
+                Some(byte_count),
+                None,
+                Some(started.elapsed().as_millis()),
+                summary,
+            ));
+            (
+                status,
+                Json(HttpSmsEnvelope {
+                    status: "success".into(),
+                    message: if replay {
+                        "communication already exists".into()
+                    } else {
+                        "communication processed".into()
+                    },
+                    data: Some(data),
+                }),
+            )
+                .into_response()
+        }
+        Err((status, message)) => {
+            state.diagnostics.record(diagnostic_event(
+                "api",
+                "response",
+                "validation-or-dispatch-failed",
+                Some(status.as_u16()),
+                Some(request_id),
+                None,
+                Some(channel),
+                Some(byte_count),
+                None,
+                Some(started.elapsed().as_millis()),
+                "REST communication request was rejected",
+            ));
+            error(status, &message)
+        }
     }
 }
 
@@ -527,7 +769,11 @@ pub fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-pub async fn deliver_webhooks(store: Arc<Store>, settings: Arc<RwLock<IntegrationSettings>>) {
+pub async fn deliver_webhooks(
+    store: Arc<Store>,
+    settings: Arc<RwLock<IntegrationSettings>>,
+    diagnostics: Arc<IntegrationDiagnostics>,
+) {
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
@@ -540,6 +786,24 @@ pub async fn deliver_webhooks(store: Arc<Store>, settings: Arc<RwLock<Integratio
         let stamp = now_ms();
         let _ = store.reconcile_rest_communications(stamp);
         if let Ok(Some(attempt)) = store.next_webhook(stamp) {
+            let started = Instant::now();
+            let payload = attempt.payload.clone();
+            let request_id = serde_json::from_str::<CommunicationWebhookRequest>(&payload)
+                .ok()
+                .map(|value| value.data.request_id);
+            diagnostics.record(diagnostic_event(
+                "webhook",
+                "request",
+                "attempt",
+                None,
+                request_id.clone(),
+                Some(attempt.communication_id.clone()),
+                None,
+                Some(payload.len()),
+                Some(payload_sha256(payload.as_bytes())),
+                None,
+                "Webhook delivery attempted",
+            ));
             let config = settings.read().unwrap_or_else(|l| l.into_inner()).clone();
             let mut request = client
                 .post(&config.webhook_url)
@@ -551,6 +815,19 @@ pub async fn deliver_webhooks(store: Arc<Store>, settings: Arc<RwLock<Integratio
             match request.send().await {
                 Ok(response) if response.status().is_success() => {
                     let _ = store.complete_webhook(attempt.id, now_ms());
+                    diagnostics.record(diagnostic_event(
+                        "webhook",
+                        "response",
+                        "success",
+                        Some(response.status().as_u16()),
+                        request_id,
+                        Some(attempt.communication_id),
+                        None,
+                        Some(payload.len()),
+                        None,
+                        Some(started.elapsed().as_millis()),
+                        "Webhook delivery accepted",
+                    ));
                 }
                 Ok(response) => {
                     let count = attempt.attempt_count + 1;
@@ -560,6 +837,19 @@ pub async fn deliver_webhooks(store: Arc<Store>, settings: Arc<RwLock<Integratio
                         now_ms() + retry_delay_ms(attempt.attempt_count),
                         &format!("HTTP {}", response.status().as_u16()),
                     );
+                    diagnostics.record(diagnostic_event(
+                        "webhook",
+                        "response",
+                        "retry",
+                        Some(response.status().as_u16()),
+                        request_id,
+                        Some(attempt.communication_id),
+                        None,
+                        Some(payload.len()),
+                        None,
+                        Some(started.elapsed().as_millis()),
+                        "Webhook delivery will be retried",
+                    ));
                 }
                 Err(error) => {
                     let count = attempt.attempt_count + 1;
@@ -573,6 +863,19 @@ pub async fn deliver_webhooks(store: Arc<Store>, settings: Arc<RwLock<Integratio
                             "request failed"
                         },
                     );
+                    diagnostics.record(diagnostic_event(
+                        "webhook",
+                        "response",
+                        "transport-failure",
+                        None,
+                        request_id,
+                        Some(attempt.communication_id),
+                        None,
+                        Some(payload.len()),
+                        None,
+                        Some(started.elapsed().as_millis()),
+                        "Webhook transport failed and will be retried",
+                    ));
                 }
             }
         } else {
@@ -588,6 +891,53 @@ mod tests {
     use axum::http::{Request, header};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
+
+    #[test]
+    fn diagnostics_are_bounded_newest_first_and_disabled_when_requested() {
+        let enabled = IntegrationDiagnostics::new(true);
+        for index in 0..=INTEGRATION_DIAGNOSTICS_CAPACITY {
+            enabled.record(diagnostic_event(
+                "api",
+                "response",
+                "success",
+                Some(201),
+                Some(format!("request-{index}")),
+                None,
+                Some("sms".into()),
+                Some(1),
+                Some("hash".into()),
+                Some(2),
+                "REST communication processed",
+            ));
+        }
+        let events = enabled.snapshot();
+        assert_eq!(events.len(), INTEGRATION_DIAGNOSTICS_CAPACITY);
+        assert_eq!(
+            events.first().and_then(|event| event.request_id.as_deref()),
+            Some("request-200")
+        );
+        assert_eq!(
+            events.last().and_then(|event| event.request_id.as_deref()),
+            Some("request-1")
+        );
+        assert!(events.iter().all(|event| !event.summary.contains("secret")));
+
+        let disabled = IntegrationDiagnostics::new(false);
+        disabled.record(diagnostic_event(
+            "api",
+            "request",
+            "received",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "REST communication request received",
+        ));
+        assert!(disabled.snapshot().is_empty());
+    }
 
     struct MockDispatcher {
         store: Arc<Store>,
@@ -659,6 +1009,7 @@ mod tests {
                 store,
                 settings,
                 dispatcher: dispatcher.clone(),
+                diagnostics: Arc::new(IntegrationDiagnostics::new(false)),
             }),
             dispatcher,
         )

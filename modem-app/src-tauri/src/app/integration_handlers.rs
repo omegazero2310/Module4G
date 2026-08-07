@@ -45,3 +45,16 @@ pub(super) async fn update_integration_settings(
         Ok(settings)
     }
 }
+
+#[tauri::command]
+pub(super) async fn list_integration_diagnostics() -> Result<Vec<IntegrationDiagnosticEvent>, String>
+{
+    #[cfg(windows)]
+    {
+        request_json(serde_json::json!({"command":"list_integration_diagnostics"})).await
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(Vec::new())
+    }
+}

@@ -57,6 +57,10 @@ REST or webhook bearer tokens, phone numbers, or content in transit. Use network
 terminating reverse proxy when the LAN cannot be fully trusted. Changing the bind address requires a
 service restart; enablement, webhook URL, and token changes apply immediately.
 
+### Integration diagnostics
+
+For short-lived integration troubleshooting, set `MODEMD_INTEGRATION_DEBUG=1` in the service environment and restart the Windows service. The Diagnostics tab then refreshes sanitized REST and webhook activity every two seconds. It retains only the newest 200 events in daemon memory and clears them at restart; tokens, headers, phone numbers, message bodies, raw JSON, webhook response text, and URL query values are never shown.
+
 ## Current implementation status
 
 Implemented: protobuf surface, byte-oriented framing including bare prompts, SMS/number limits,
