@@ -3,10 +3,23 @@
   "productName": "A7670 Modem",
   "version": "0.1.0",
   "identifier": "com.a7670.modem",
-  "build": { "beforeDevCommand": "npm run dev", "devUrl": "http://localhost:1420", "beforeBuildCommand": "npm run build", "frontendDist": "../dist" },
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ../scripts/prepare-tauri-bundle.ps1 && npm run build",
+    "frontendDist": "../dist"
+  },
   "app": { "windows": [{ "title": "A7670 Modem", "width": 1120, "height": 760, "minWidth": 760, "minHeight": 560 }] },
   "bundle": {
-    "active": true, "targets": ["nsis"],
-    "windows": { "nsis": { "installMode": "perMachine" } }
+    "active": true,
+    "targets": ["nsis"],
+    "useLocalToolsDir": true,
+    "externalBin": ["binaries/modemd"],
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine",
+        "installerHooks": "nsis/installer-hooks.nsh"
+      }
+    }
   }
 }

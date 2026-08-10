@@ -110,17 +110,9 @@ Start the Tauri app only after `--console` is running. Do not start `modem-sim` 
 
 For low-level AMR troubleshooting, stop the service before running `scripts\diagnose-a7670-upload.ps1 -Port COMx`. That script intentionally leaves diagnostic files on the modem.
 
-## Release builds
+## Release builds and deployment
 
-Build the service executable:
-
-```powershell
-cargo build -p modemd --release
-```
-
-The service executable is `target\release\modemd.exe`.
-
-Build the desktop installer:
+Build the combined desktop and service installer:
 
 ```powershell
 cd modem-app
@@ -128,17 +120,19 @@ npm.cmd install
 npm.cmd run tauri build
 ```
 
-This runs the frontend production build and creates the configured per-machine NSIS installer. Locate the generated `.exe` without relying on a Cargo target-layout detail:
+This is the single production release entry point. It first builds `modemd.exe` in release mode, builds the frontend and desktop executable, and then creates a per-machine NSIS installer containing both executables. A daemon build or staging failure fails the Tauri build. Locate the generated installer without relying on a Cargo target-layout detail:
 
 ```powershell
 Get-ChildItem -Recurse -Filter "*setup*.exe" .\src-tauri\target, ..\target -ErrorAction SilentlyContinue
 ```
 
-Before shipping, normally run the full verification sequence in **Build and test**, then build both release artifacts.
+Before shipping, normally run the full verification sequence in **Build and test**, then build this installer. Run it as an administrator on the destination PC. It installs `modem-app.exe` and `modemd.exe` together under the selected Program Files directory, creates or canonicalizes `A7670ModemService` as `NT AUTHORITY\LocalService`, configures delayed automatic startup and 5/15/60-second recovery restarts, and verifies that the service starts.
 
-## Deploy the service to another PC
+Reinstalling or upgrading stops the service before replacing `modemd.exe`, reapplies its canonical configuration, and starts the bundled version. Normal uninstall stops and deletes the service before removing the application binaries. Installation, upgrade, and uninstall always retain `%ProgramData%\A7670 Modem`, including the SQLite database, settings, history, integration secrets, and pending webhook records.
 
-Build on a compatible Windows x64 build machine, then copy `target\release\modemd.exe` to the destination (or copy the entire source checkout and build there). On the destination, open **PowerShell as Administrator** and run:
+## Standalone service fallback
+
+Use the scripts below only for development or troubleshooting when the combined NSIS installer cannot be used. Build on a compatible Windows x64 machine, copy `target\release\modemd.exe` and the scripts to the destination as needed, then open **PowerShell as Administrator**:
 
 ```powershell
 # If modemd.exe and install-service.ps1 were copied to C:\Install
@@ -149,7 +143,7 @@ Set-Location C:\Install
 .\scripts\install-service.ps1
 ```
 
-The installer script copies the binary to `C:\Program Files\A7670 Modem\modemd.exe`, creates or updates `A7670ModemService` under `NT AUTHORITY\LocalService`, configures delayed automatic startup and recovery restarts, and starts it. Runtime data is retained in `%ProgramData%\A7670 Modem\modemd.sqlite3` across upgrades.
+The fallback installer copies the daemon to `C:\Program Files\A7670 Modem\modemd.exe`, creates or updates the same service configuration, and starts it. All service-control operations are checked and bounded by the same 30-second timeout used by the NSIS package.
 
 Verify the deployment:
 
@@ -158,15 +152,13 @@ Get-Service A7670ModemService
 Test-Path "$env:ProgramData\A7670 Modem\modemd.sqlite3"
 ```
 
-The second command confirms that the service created its SQLite data file; inspect its contents with a SQLite client. To stop/remove the service but retain data:
+The second command confirms that the service created its SQLite data file; inspect its contents with a SQLite client. To stop and unregister only the service while retaining both application binaries and data:
 
 ```powershell
 .\scripts\uninstall-service.ps1
 ```
 
-Use `.\scripts\uninstall-service.ps1 -PurgeData` only when intentionally deleting all local modem history, settings, audio metadata, REST communications, and pending webhook records.
-
-Deploy the desktop UI separately by running the generated NSIS installer as an administrator. The app can be installed on the same PC as the service and connects to its local pipe; it is not a remote client.
+The fallback uninstaller deliberately does not delete the combined Tauri installation directory. Use `.\scripts\uninstall-service.ps1 -PurgeData` only when intentionally deleting all local modem history, settings, integration secrets, audio metadata, REST communications, and pending webhook records. The normal NSIS uninstaller never purges this data.
 
 ## REST and webhook integration
 

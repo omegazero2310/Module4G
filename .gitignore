@@ -2,6 +2,7 @@
 /modem-app/node_modules
 /modem-app/dist
 /modem-app/src-tauri/target
+/modem-app/src-tauri/binaries
 *.log
 .env
 /tmp/pdfs/*
