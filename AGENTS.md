@@ -9,16 +9,19 @@ This is a Windows-focused Rust 2024 workspace with a Tauri 2 / React 19 desktop 
 - `crates/modem-sim/`: deterministic Windows named-pipe simulator. Keep its JSON envelopes, legacy replies, IDs, and failure scenarios compatible with the host contract.
 - `modem-app/src-tauri/`: native Tauri commands and named-pipe client. This is the only UI-layer component permitted to access `\\.\pipe\a7670-modemd-v1`.
 - `modem-app/src/`: React UI, pages, formatting helpers, types, and Vitest tests. Browser code calls Tauri commands only. The Settings page manages integration settings without reading stored secrets; the Diagnostics page can display sanitized integration activity.
-- `scripts/`: elevated service installation/removal and direct AMR-upload diagnostic scripts.
+- `scripts/`: elevated service installation/removal, Tauri bundle preparation, SIMCom driver preparation/validation, and direct AMR-upload diagnostic scripts.
+- `third_party/simcom/windows10-x64-serial/`: manifest and instructions for the locally staged, minimal Windows 10/11 x64 SIMCom filter/serial driver payload. Vendor INF/CAT/SYS files are intentionally gitignored and are not distributed by the repository.
 - `a7670c-sms-send-delivery-status.md` and `a7670c-automation-plan (2).md`: hardware behavior and acceptance context; update them when implementation behavior or acceptance evidence changes.
 
 The production service owns the serial port. Do not add direct COM or named-pipe access to React/browser code, and do not create a second production serial-port owner. The app can target `modem-sim` during development or the installed service in production; do not run both on the same pipe.
 
 Production data is `%ProgramData%\A7670 Modem\modemd.sqlite3`. The service pipe is local-only, rejects remote clients, and has an explicit Windows DACL. Preserve those properties.
 
-## REST and Webhook Integration
+## REST, Health, and Webhook Integration
 
-The daemon exposes `POST /api/v1/communications` on the configurable REST bind address (default `0.0.0.0:5069`). The listener rejects requests unless REST is enabled and a stored bearer token matches; REST cannot be enabled without a token. The endpoint accepts immediate `sms` and `call` communications with a non-empty opaque `request_id`, which is the idempotency key. The daemon generates the communication UUID (`data.id`), returns the normalized destination as `data.contact`, and replays the original communication for a duplicate `request_id`.
+The daemon exposes `POST /api/v1/communications` and `GET /api/v1/health` on the configurable REST bind address (default `0.0.0.0:5069`). The listener rejects requests unless REST is enabled and a stored bearer token matches; REST cannot be enabled without a token. Both endpoints require the same bearer authentication. The communications endpoint accepts immediate `sms` and `call` communications with a non-empty opaque `request_id`, which is the idempotency key. The daemon generates the communication UUID (`data.id`), returns the normalized destination as `data.contact`, and replays the original communication for a duplicate `request_id`.
+
+The health endpoint returns only the JSON boolean `true` with `200 OK` when the periodic hardware state is `Ready` and the newest classified outbound SMS/call attempt in the last 24 hours does not indicate a modem or dispatch failure. It returns only `false` with `503 Service Unavailable` otherwise. Idle Ready hardware is healthy; in-progress attempts are neutral; recipient outcomes such as SMS delivery failure, busy, or no-answer do not make the daemon unhealthy. Do not add port names, destinations, error details, or other diagnostics to this response.
 
 For calls, `content` is the case-insensitive name of a validated uploaded AMR-NB file. Empty content selects the current audio file and must fail validation when no current audio exists. Future `send_at` scheduling is not supported. Preserve the request/response casing and the limited webhook payload: event type plus `id`, `request_id`, and nullable `failure_reason` only.
 
@@ -43,9 +46,14 @@ npm.cmd install
 npm.cmd test
 npm.cmd run build
 npm.cmd run tauri dev
+npm.cmd run tauri build
 ```
 
 Start either the simulator or service before launching the Tauri app. `modemd --scan` is a read-only physical-port discovery/initialization aid; `modemd --console` runs the named-pipe host outside SCM for local debugging. Build the release service with `cargo build -p modemd --release`, then run `scripts\install-service.ps1` from an elevated PowerShell. Uninstall retains ProgramData unless explicitly passed `-PurgeData`.
+
+The combined production release entry point is `npm.cmd run tauri build` from `modem-app`. Before that build, obtain the authorized SIMCom `Windows10.zip` outside the repository and run `scripts\prepare-simcom-driver.ps1 -SourceZip <path>`. The preparation flow verifies the approved archive hash, copies only the six allowlisted x64 files, verifies individual hashes, catalog signatures, and A7670 hardware IDs, and removes its temporary extraction. The Tauri pre-build hook validates that payload again, builds `modemd.exe` in release mode, stages it as a Tauri sidecar, and fails the build on validation, daemon-build, or staging errors.
+
+The NSIS installer is per-machine and requires elevation. It stages `simfilter.inf` before `simser.inf` using the native x64 `pnputil.exe`, then creates or canonicalizes `A7670ModemService` as `NT AUTHORITY\LocalService` with delayed automatic start and 5/15/60-second recovery restarts. Upgrades stop the service before replacing binaries. Normal uninstall removes the service and application files but retains both `%ProgramData%\A7670 Modem` and published Driver Store packages. Do not change driver ordering, silently tolerate genuine driver rejection, force driver downgrades, or purge retained data during a normal uninstall.
 
 For physical AMR investigation, stop the service first, then run `scripts\diagnose-a7670-upload.ps1 -Port COMx`. The script intentionally leaves diagnostic files on the modem; document and clean them up during acceptance.
 
@@ -61,6 +69,7 @@ For physical AMR investigation, stop the service first, then run `scripts\diagno
 - Interactive uploads and SMS submissions have distinct prompt/final-result deadlines and must resynchronize framing after timeout. An indeterminate submission is `send-unknown`, not `send-failed`.
 - Accept validated AMR-NB only. Preserve safe module paths, paced uploads, duration metadata, audio-library selection, and call-history linkage.
 - Keep REST request idempotency atomic with communication reservation and dispatch. Do not create lifecycle webhooks for UI-originated SMS/calls, reorder events for the same REST communication, follow webhook redirects, or expose persisted integration tokens.
+- Keep REST health authenticated and deliberately minimal. Its result combines current Ready hardware with only the newest classified outbound attempt in the 24-hour window; do not treat delivery/busy/no-answer recipient outcomes or in-progress work as daemon failures.
 - Call lifecycle mapping is externally visible: an answered call that ends is `delivered`; busy/no-answer/signaling-timeout/terminal errors are `failed`; a pre-answer local hang-up remains `sent` and emits no failure webhook.
 - Keep the guarded console validation and request/response log redaction. Never log numbers, message bodies, audio payloads, raw PDU, balance content, or unrestricted AT output.
 
@@ -74,7 +83,7 @@ Keep protocol and schema transitions explicit. For `.proto` changes, update gene
 
 ## Testing and Hardware Acceptance
 
-Add focused tests beside the Rust module under test and use Vitest/Testing Library for UI behavior. Cover framing/URC separation, validation, PDU/GSM7/UCS2 decoding, multipart assembly, storage migrations and archive ordering, delivery correlation/expiry, timeout recovery, call state transitions, simulator determinism, REST authorization/validation/idempotency, durable ordered webhook retry, call-to-webhook lifecycle mapping, integration-secret redaction, diagnostics sanitization, and Tauri serialization/log redaction as applicable.
+Add focused tests beside the Rust module under test and use Vitest/Testing Library for UI behavior. Cover framing/URC separation, validation, PDU/GSM7/UCS2 decoding, multipart assembly, storage migrations and archive ordering, delivery correlation/expiry, timeout recovery, call state transitions, simulator determinism, REST authorization/validation/idempotency, health authentication/status/body and 24-hour evidence classification, durable ordered webhook retry, call-to-webhook lifecycle mapping, integration-secret redaction, diagnostics sanitization, and Tauri serialization/log redaction as applicable.
 
 Before handing off a code change, run the narrow relevant tests and normally also:
 
@@ -90,4 +99,4 @@ Hardware-dependent changes require documented evidence: A7670 model, COM port, `
 
 Use short imperative commit subjects, optionally scoped (for example, `sms: handle CMGS prompt timeout`). Keep changes focused; call out protocol/schema changes, migrations, service installer changes, SMS-state changes, REST/webhook contract or security changes, and hardware compatibility in review notes. Include UI screenshots when visuals change.
 
-Never commit generated build output from `target/` or `modem-app/dist/`, runtime databases, modem diagnostic payloads, integration bearer tokens, webhook captures, or private logs. Treat `output_test.amr` as a local diagnostic artifact, not an application asset. Do not weaken local pipe ACLs, remote-client rejection, REST authentication, webhook payload minimization, console guards, or data-retention behavior without an explicit security review.
+Never commit generated build output from `target/` or `modem-app/dist/`, locally staged SIMCom INF/CAT/SYS files or the source driver ZIP, runtime databases, modem diagnostic payloads, integration bearer tokens, webhook captures, or private logs. Treat `output_test.amr` as a local diagnostic artifact, not an application asset. Keep vendor driver files byte-for-byte unchanged and restrict generated installers containing them to authorized internal distribution. Do not weaken local pipe ACLs, remote-client rejection, REST authentication (including health), webhook payload minimization, console guards, or data-retention behavior without an explicit security review.
