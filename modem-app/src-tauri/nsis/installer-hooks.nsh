@@ -18,7 +18,7 @@
 !macroend
 
 !macro ModemdWaitForStatus STATUS CONTEXT
-  nsExec::ExecToStack '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "try { (Get-Service -Name ${MODEMD_SERVICE} -ErrorAction Stop).WaitForStatus('${STATUS}', [TimeSpan]::FromSeconds(${MODEMD_WAIT_SECONDS})); exit 0 } catch { exit 1 }"'
+  nsExec::ExecToStack '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "try { (Get-Service -Name ${MODEMD_SERVICE} -ErrorAction Stop).WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::${STATUS}, [TimeSpan]::FromSeconds(${MODEMD_WAIT_SECONDS})); exit 0 } catch { exit 1 }"'
   Pop $0
   Pop $1
   ${If} $0 != 0
