@@ -9,8 +9,9 @@ Windows 10/11 x64 desktop software for one SIMCom A7670C-LANS modem. The solutio
 - Visual Studio Build Tools with **Desktop development with C++** and a Windows SDK.
 - Node.js 20 or newer and npm.
 - Microsoft Edge WebView2 Runtime (normally already present on supported Windows installations).
-- An A7670C-LANS modem for physical-modem use. The production installer bundles
-  the internal SIMCom Windows 10 x64 filter and serial drivers.
+- An A7670C-LANS modem for physical-modem use. Builders must separately obtain
+  and locally stage the SIMCom Windows 10 x64 filter and serial drivers before
+  creating the production installer.
 
 `protoc` is supplied by the Rust build, so it does not need a separate installation.
 
@@ -113,12 +114,13 @@ For low-level AMR troubleshooting, stop the service before running `scripts\diag
 
 ## Release builds and deployment
 
-The minimal signed driver payload is stored in
-`third_party\simcom\windows10-x64-serial`. For a fresh internal checkout where
-the payload must be reconstructed from `Windows10.zip`, follow the extraction,
-hash-verification, exact-file-copy, and bundle instructions in
+The repository does not distribute SIMCom driver files. Before building, obtain
+the authorized `Windows10.zip` package and stage the minimal signed payload
+locally in `third_party\simcom\windows10-x64-serial`. Follow the download-source,
+archive-verification, extraction, exact-file-copy, and bundle instructions in
 [the SIMCom driver preparation guide](third_party/simcom/windows10-x64-serial/README.md).
-Do not copy the complete vendor archive into the repository or installer.
+The staged INF/CAT/SYS files are gitignored and must not be committed. Do not
+copy the complete vendor archive into the repository or installer.
 
 Build the combined desktop and service installer:
 

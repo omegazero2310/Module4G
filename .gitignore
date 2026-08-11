@@ -10,6 +10,3 @@ Cargo.lock
 *.inf
 *.cat
 *.sys
-!third_party/simcom/windows10-x64-serial/**/*.inf
-!third_party/simcom/windows10-x64-serial/**/*.cat
-!third_party/simcom/windows10-x64-serial/**/*.sys
