@@ -9,7 +9,8 @@ Windows 10/11 x64 desktop software for one SIMCom A7670C-LANS modem. The solutio
 - Visual Studio Build Tools with **Desktop development with C++** and a Windows SDK.
 - Node.js 20 or newer and npm.
 - Microsoft Edge WebView2 Runtime (normally already present on supported Windows installations).
-- An A7670C-LANS modem and its Windows USB serial driver for physical-modem use.
+- An A7670C-LANS modem for physical-modem use. The production installer bundles
+  the internal SIMCom Windows 10 x64 filter and serial drivers.
 
 `protoc` is supplied by the Rust build, so it does not need a separate installation.
 
@@ -112,6 +113,13 @@ For low-level AMR troubleshooting, stop the service before running `scripts\diag
 
 ## Release builds and deployment
 
+The minimal signed driver payload is stored in
+`third_party\simcom\windows10-x64-serial`. For a fresh internal checkout where
+the payload must be reconstructed from `Windows10.zip`, follow the extraction,
+hash-verification, exact-file-copy, and bundle instructions in
+[the SIMCom driver preparation guide](third_party/simcom/windows10-x64-serial/README.md).
+Do not copy the complete vendor archive into the repository or installer.
+
 Build the combined desktop and service installer:
 
 ```powershell
@@ -120,15 +128,30 @@ npm.cmd install
 npm.cmd run tauri build
 ```
 
-This is the single production release entry point. It first builds `modemd.exe` in release mode, builds the frontend and desktop executable, and then creates a per-machine NSIS installer containing both executables. A daemon build or staging failure fails the Tauri build. Locate the generated installer without relying on a Cargo target-layout detail:
+This is the single production release entry point. It first validates the bundled SIMCom driver files and catalog signatures, builds `modemd.exe` in release mode, builds the frontend and desktop executable, and then creates a per-machine NSIS installer containing both executables and only the required x64 filter/serial driver packages. A driver validation, daemon build, or staging failure fails the Tauri build. Locate the generated installer without relying on a Cargo target-layout detail:
 
 ```powershell
 Get-ChildItem -Recurse -Filter "*setup*.exe" .\src-tauri\target, ..\target -ErrorAction SilentlyContinue
 ```
 
-Before shipping, normally run the full verification sequence in **Build and test**, then build this installer. Run it as an administrator on the destination PC. It installs `modem-app.exe` and `modemd.exe` together under the selected Program Files directory, creates or canonicalizes `A7670ModemService` as `NT AUTHORITY\LocalService`, configures delayed automatic startup and 5/15/60-second recovery restarts, and verifies that the service starts.
+Before shipping, normally run the full verification sequence in **Build and test**, then build this installer. Run it as an administrator on Windows 10 or Windows 11 x64. The driver and generated installer are restricted to internal distribution pending separate SIMCom redistribution approval.
 
-Reinstalling or upgrading stops the service before replacing `modemd.exe`, reapplies its canonical configuration, and starts the bundled version. Normal uninstall stops and deletes the service before removing the application binaries. Installation, upgrade, and uninstall always retain `%ProgramData%\A7670 Modem`, including the SQLite database, settings, history, integration secrets, and pending webhook records.
+Setup installs `modem-app.exe` and `modemd.exe` under the selected Program Files directory. Before registering the service, it stages `simfilter.inf` and then `simser.inf` in the Windows Driver Store, and asks Plug and Play to bind them to a connected modem without forcing a downgrade from a newer or better-ranked driver. The modem may be disconnected during setup. A missing device or an already-selected newer driver is not an error; connect the modem later and Windows will use the staged packages. If Windows reports that a reboot is required, setup marks the installation for reboot. A genuine driver rejection aborts setup before service registration and identifies the INF, `pnputil` exit code, and `%WINDIR%\inf\setupapi.dev.log`.
+
+After staging the drivers, setup creates or canonicalizes `A7670ModemService` as `NT AUTHORITY\LocalService`, configures delayed automatic startup and 5/15/60-second recovery restarts, and verifies that the service starts.
+
+Reinstalling or upgrading stops the service before replacing `modemd.exe`, stages the drivers without forcing an older version, reapplies the service's canonical configuration, and starts the bundled version. Normal uninstall stops and deletes the service before removing the application binaries and bundled driver source files. It deliberately leaves the published driver packages in the Windows Driver Store because connected hardware may still use them. Installation, upgrade, and uninstall always retain `%ProgramData%\A7670 Modem`, including the SQLite database, settings, history, integration secrets, and pending webhook records.
+
+Verify driver staging and the AT port from an elevated PowerShell prompt:
+
+```powershell
+pnputil.exe /enum-drivers /class Ports
+pnputil.exe /enum-devices /connected /deviceid 'USB\VID_1E0E&PID_9011'
+Get-CimInstance Win32_SerialPort | Where-Object PNPDeviceID -like 'USB\VID_1E0E&PID_9011*'
+Get-Service A7670ModemService
+```
+
+If staging fails, inspect `%WINDIR%\inf\setupapi.dev.log`, confirm the OS is x64 Windows 10/11, and run `pnputil.exe /add-driver "$env:ProgramFiles\A7670 Modem\drivers\simcom\simfilter.inf" /install` from an elevated prompt to reproduce the filter-package error. Repeat with `simser.inf` only after the filter package succeeds. Do not edit the vendor files: `scripts\validate-simcom-driver.ps1 -SourceZip D:\path\to\Windows10.zip` verifies the source archive, required layout, individual hashes, hardware IDs, and catalog signatures.
 
 ## Standalone service fallback
 

@@ -78,6 +78,39 @@ Function ModemdInstallAndStart
   !insertmacro ModemdWaitForStatus "Running" "Starting ${MODEMD_SERVICE}"
 FunctionEnd
 
+!macro ModemdStageDriver INF_NAME
+  nsExec::ExecToStack '"$SYSDIR\pnputil.exe" /add-driver "$INSTDIR\drivers\simcom\${INF_NAME}"'
+  Pop $0
+  Pop $1
+  ${If} $0 == 3010
+    SetRebootFlag true
+  ${ElseIf} $0 != 0
+    MessageBox MB_OK|MB_ICONSTOP "Windows rejected staging ${INF_NAME} (pnputil.exe exit code $0). Setup will stop before registering ${MODEMD_SERVICE}.$\r$\nSee $WINDIR\inf\setupapi.dev.log for details.$\r$\n$1"
+    Abort
+  ${EndIf}
+!macroend
+
+!macro ModemdInstallDriver INF_NAME
+  nsExec::ExecToStack '"$SYSDIR\pnputil.exe" /add-driver "$INSTDIR\drivers\simcom\${INF_NAME}" /install'
+  Pop $0
+  Pop $1
+  ${If} $0 == 3010
+    SetRebootFlag true
+  ${ElseIf} $0 == 259
+    DetailPrint "${INF_NAME}: no matching connected device, or Windows retained a newer/better-ranked driver."
+  ${ElseIf} $0 != 0
+    MessageBox MB_OK|MB_ICONSTOP "Windows rejected installation of ${INF_NAME} (pnputil.exe exit code $0). Setup will stop before registering ${MODEMD_SERVICE}.$\r$\nSee $WINDIR\inf\setupapi.dev.log for details.$\r$\n$1"
+    Abort
+  ${EndIf}
+!macroend
+
+Function ModemdInstallDrivers
+  !insertmacro ModemdStageDriver "simfilter.inf"
+  !insertmacro ModemdStageDriver "simser.inf"
+  !insertmacro ModemdInstallDriver "simfilter.inf"
+  !insertmacro ModemdInstallDriver "simser.inf"
+FunctionEnd
+
 Function un.ModemdServiceExists
   !insertmacro ModemdQueryService "un."
 FunctionEnd
@@ -128,6 +161,7 @@ FunctionEnd
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
+  Call ModemdInstallDrivers
   Call ModemdInstallAndStart
 !macroend
 

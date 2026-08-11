@@ -15,6 +15,14 @@
     "targets": ["nsis"],
     "useLocalToolsDir": true,
     "externalBin": ["binaries/modemd"],
+    "resources": {
+      "../../third_party/simcom/windows10-x64-serial/simfilter.inf": "drivers/simcom/simfilter.inf",
+      "../../third_party/simcom/windows10-x64-serial/simlteusbfilter.cat": "drivers/simcom/simlteusbfilter.cat",
+      "../../third_party/simcom/windows10-x64-serial/filter/amd64/simlteusbfilter.sys": "drivers/simcom/filter/amd64/simlteusbfilter.sys",
+      "../../third_party/simcom/windows10-x64-serial/simser.inf": "drivers/simcom/simser.inf",
+      "../../third_party/simcom/windows10-x64-serial/simlteusbser.cat": "drivers/simcom/simlteusbser.cat",
+      "../../third_party/simcom/windows10-x64-serial/serial/amd64/simlteusbser.sys": "drivers/simcom/serial/amd64/simlteusbser.sys"
+    },
     "windows": {
       "nsis": {
         "installMode": "perMachine",

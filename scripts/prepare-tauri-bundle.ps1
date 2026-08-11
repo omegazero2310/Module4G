@@ -8,6 +8,8 @@ $source = Join-Path $workspace 'target\release\modemd.exe'
 $bundleDirectory = Join-Path $workspace 'modem-app\src-tauri\binaries'
 $bundleBinary = Join-Path $bundleDirectory 'modemd-x86_64-pc-windows-msvc.exe'
 
+& (Join-Path $PSScriptRoot 'validate-simcom-driver.ps1')
+
 & cargo build --manifest-path $manifest -p modemd --release
 if ($LASTEXITCODE -ne 0) {
     throw "Failed to build modemd.exe (cargo exit code $LASTEXITCODE)."
