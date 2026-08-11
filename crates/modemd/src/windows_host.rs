@@ -247,6 +247,7 @@ pub mod host {
         let rest_state = RestState {
             store: Arc::clone(&store),
             settings: Arc::clone(&integration_settings),
+            hardware_state: Arc::clone(&device_state),
             dispatcher: rest_dispatcher,
             diagnostics: Arc::clone(&integration_diagnostics),
         };

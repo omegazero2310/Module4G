@@ -193,7 +193,9 @@ The fallback uninstaller deliberately does not delete the combined Tauri install
 
 ## REST and webhook integration
 
-The service optionally exposes `POST /api/v1/communications` on `0.0.0.0:5069` by default. Enable REST and set its bearer token through Settings; REST cannot be enabled without a token. It accepts immediate `sms` and `call` requests with a non-empty opaque `request_id` and replays the originally reserved communication for duplicate request IDs.
+The service optionally exposes `POST /api/v1/communications` and `GET /api/v1/health` on `0.0.0.0:5069` by default. Enable REST and set its bearer token through Settings; REST cannot be enabled without a token, and both endpoints require `Authorization: Bearer <configured-token>`. The communications endpoint accepts immediate `sms` and `call` requests with a non-empty opaque `request_id` and replays the originally reserved communication for duplicate request IDs.
+
+The health endpoint returns the JSON primitive `true` with `200 OK` when the periodic modem probe reports Ready and the newest classified outbound SMS/call attempt from the last 24 hours does not indicate a modem or dispatch failure. It returns `false` with `503 Service Unavailable` otherwise. An idle Ready modem is healthy; in-progress attempts are neutral, and recipient outcomes such as SMS delivery failure, busy, or no-answer do not make the daemon unhealthy. The response never includes port names, destinations, errors, or other diagnostics.
 
 Only REST-created communications create webhooks. Webhook payloads are deliberately minimal: event type plus `id`, `request_id`, and nullable `failure_reason`. This is intended for a firewall-restricted trusted LAN: HTTP does not protect bearer tokens or communication data in transit. Use network isolation or a TLS-terminating reverse proxy when needed. A REST bind-address change takes effect after restarting the service; other integration settings take effect immediately.
 

@@ -1,5 +1,6 @@
 use crate::{
     ModemError,
+    hardware::HardwareState,
     storage::{CommunicationReservation, IntegrationSettings, RestCommunication, Store},
 };
 use async_trait::async_trait;
@@ -9,7 +10,7 @@ use axum::{
     extract::{DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -244,15 +245,52 @@ pub trait CommunicationDispatcher: Send + Sync {
 pub struct RestState {
     pub store: Arc<Store>,
     pub settings: Arc<RwLock<IntegrationSettings>>,
+    pub hardware_state: Arc<RwLock<HardwareState>>,
     pub dispatcher: Arc<dyn CommunicationDispatcher>,
     pub diagnostics: Arc<IntegrationDiagnostics>,
 }
 
 pub fn router(state: RestState) -> Router {
     Router::new()
+        .route("/api/v1/health", get(get_health))
         .route("/api/v1/communications", post(post_communication))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
+}
+
+async fn get_health(State(state): State<RestState>, headers: HeaderMap) -> Response {
+    let settings = state
+        .settings
+        .read()
+        .unwrap_or_else(|lock| lock.into_inner())
+        .clone();
+    if !settings.rest_enabled
+        || settings.rest_token.is_empty()
+        || !authorized(&headers, &settings.rest_token)
+    {
+        return error(StatusCode::UNAUTHORIZED, "authentication required");
+    }
+
+    let hardware_ready = matches!(
+        &*state
+            .hardware_state
+            .read()
+            .unwrap_or_else(|lock| lock.into_inner()),
+        HardwareState::Ready { .. }
+    );
+    let cutoff_ms = now_ms().saturating_sub(86_400_000);
+    let communication_healthy = state
+        .store
+        .latest_outbound_health_evidence(cutoff_ms)
+        .unwrap_or(Some(false))
+        .unwrap_or(true);
+    let healthy = hardware_ready && communication_healthy;
+    let status = if healthy {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, Json(healthy)).into_response()
 }
 
 pub async fn serve(listener: tokio::net::TcpListener, state: RestState) -> std::io::Result<()> {
@@ -1014,6 +1052,9 @@ mod tests {
             router(RestState {
                 store,
                 settings,
+                hardware_state: Arc::new(RwLock::new(HardwareState::Ready {
+                    port_name: "COM1".into(),
+                })),
                 dispatcher: dispatcher.clone(),
                 diagnostics: Arc::new(IntegrationDiagnostics::new(false)),
             }),
@@ -1030,6 +1071,151 @@ mod tests {
             builder = builder.header(header::AUTHORIZATION, "Bearer secret");
         }
         builder.body(Body::from(body.to_string())).unwrap()
+    }
+
+    fn health_fixture(
+        hardware: HardwareState,
+    ) -> (
+        Router,
+        Arc<Store>,
+        Arc<RwLock<IntegrationSettings>>,
+        Arc<RwLock<HardwareState>>,
+    ) {
+        let store = Arc::new(Store::memory().unwrap());
+        let dispatcher = Arc::new(MockDispatcher {
+            store: Arc::clone(&store),
+            sends: AtomicUsize::new(0),
+            calls: AtomicUsize::new(0),
+        });
+        let settings = Arc::new(RwLock::new(IntegrationSettings {
+            rest_enabled: true,
+            rest_token: "secret".into(),
+            ..Default::default()
+        }));
+        let hardware_state = Arc::new(RwLock::new(hardware));
+        let app = router(RestState {
+            store: Arc::clone(&store),
+            settings: Arc::clone(&settings),
+            hardware_state: Arc::clone(&hardware_state),
+            dispatcher,
+            diagnostics: Arc::new(IntegrationDiagnostics::new(false)),
+        });
+        (app, store, settings, hardware_state)
+    }
+
+    fn health_request(auth: bool) -> Request<Body> {
+        let mut builder = Request::builder().method("GET").uri("/api/v1/health");
+        if auth {
+            builder = builder.header(header::AUTHORIZATION, "Bearer secret");
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    async fn health_response(app: Router, auth: bool) -> (StatusCode, String, String) {
+        let response = app.oneshot(health_request(auth)).await.unwrap();
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        (
+            status,
+            String::from_utf8(body.to_vec()).unwrap(),
+            content_type,
+        )
+    }
+
+    #[tokio::test]
+    async fn health_requires_enabled_rest_and_valid_authentication() {
+        let (app, _, settings, _) = health_fixture(HardwareState::Ready {
+            port_name: "COM1".into(),
+        });
+        assert_eq!(
+            health_response(app.clone(), false).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        let invalid = Request::builder()
+            .method("GET")
+            .uri("/api/v1/health")
+            .header(header::AUTHORIZATION, "Bearer wrong")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(invalid).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        *settings.write().unwrap() = IntegrationSettings {
+            rest_enabled: false,
+            rest_token: "secret".into(),
+            ..Default::default()
+        };
+        assert_eq!(health_response(app, true).await.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn health_returns_exact_json_boolean_for_ready_disconnected_and_busy_hardware() {
+        let (app, _, _, hardware) = health_fixture(HardwareState::Ready {
+            port_name: "COM1".into(),
+        });
+        assert_eq!(
+            health_response(app.clone(), true).await,
+            (StatusCode::OK, "true".into(), "application/json".into())
+        );
+        *hardware.write().unwrap() = HardwareState::Disconnected;
+        assert_eq!(
+            health_response(app.clone(), true).await,
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "false".into(),
+                "application/json".into()
+            )
+        );
+        *hardware.write().unwrap() = HardwareState::PortBusy {
+            port_name: "COM1".into(),
+        };
+        assert_eq!(
+            health_response(app, true).await.0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn recent_failure_makes_health_false_and_a_newer_success_restores_it() {
+        let (app, store, _, _) = health_fixture(HardwareState::Ready {
+            port_name: "COM1".into(),
+        });
+        let stamp = now_ms();
+        store
+            .save_sms(&SmsRecord {
+                id: "failed".into(),
+                direction: "outbound".into(),
+                state: "send-failed".into(),
+                source: "app".into(),
+                created_at_ms: stamp - 1,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            health_response(app.clone(), true).await.0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        store
+            .save_sms(&SmsRecord {
+                id: "submitted".into(),
+                direction: "outbound".into(),
+                state: "submitted".into(),
+                source: "app".into(),
+                created_at_ms: stamp,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(health_response(app, true).await.0, StatusCode::OK);
     }
 
     #[tokio::test]

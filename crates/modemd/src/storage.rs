@@ -8,6 +8,7 @@ use delivery::*;
 mod audio;
 mod balance;
 mod calls;
+mod health;
 mod integration;
 mod schema;
 mod sms;
