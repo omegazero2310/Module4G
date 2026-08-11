@@ -122,6 +122,12 @@ archive-verification, extraction, exact-file-copy, and bundle instructions in
 The staged INF/CAT/SYS files are gitignored and must not be committed. Do not
 copy the complete vendor archive into the repository or installer.
 
+From the repository root, prepare the local payload with:
+
+```powershell
+.\scripts\prepare-simcom-driver.ps1 -SourceZip 'D:\path\to\Windows10.zip'
+```
+
 Build the combined desktop and service installer:
 
 ```powershell

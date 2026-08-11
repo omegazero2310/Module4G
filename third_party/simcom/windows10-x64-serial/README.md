@@ -28,36 +28,18 @@ Perform these steps on every new build checkout because the six vendor files are
 not distributed with the repository. Keep the downloaded archive outside the
 repository.
 
-Run the following commands in PowerShell from the repository root. Change only
-`$driverZip` if the archive is stored elsewhere:
+Run the preparation script in PowerShell from the repository root, passing the
+downloaded archive's location:
 
 ```powershell
-$driverZip = 'D:\Windows_simcom\Windows10.zip'
-$driverExtract = Join-Path $env:TEMP 'a7670-simcom-driver-source'
-$driverDest = Join-Path (Get-Location) 'third_party\simcom\windows10-x64-serial'
-
-$expectedZipHash = 'F15D32F45114DE499A770C55477BF808CC9026C736CB28060BD0B906B1758024'
-$actualZipHash = (Get-FileHash -LiteralPath $driverZip -Algorithm SHA256).Hash
-if ($actualZipHash -ne $expectedZipHash) {
-    throw "Unexpected SIMCom driver archive hash: $actualZipHash"
-}
-
-New-Item -ItemType Directory -Path $driverExtract -Force | Out-Null
-Expand-Archive -LiteralPath $driverZip -DestinationPath $driverExtract -Force
-$driverSource = Join-Path $driverExtract 'Windows10'
-
-New-Item -ItemType Directory -Path (Join-Path $driverDest 'filter\amd64') -Force | Out-Null
-New-Item -ItemType Directory -Path (Join-Path $driverDest 'serial\amd64') -Force | Out-Null
-
-Copy-Item -LiteralPath (Join-Path $driverSource 'simfilter.inf') -Destination $driverDest -Force
-Copy-Item -LiteralPath (Join-Path $driverSource 'simlteusbfilter.cat') -Destination $driverDest -Force
-Copy-Item -LiteralPath (Join-Path $driverSource 'filter\amd64\simlteusbfilter.sys') -Destination (Join-Path $driverDest 'filter\amd64') -Force
-Copy-Item -LiteralPath (Join-Path $driverSource 'simser.inf') -Destination $driverDest -Force
-Copy-Item -LiteralPath (Join-Path $driverSource 'simlteusbser.cat') -Destination $driverDest -Force
-Copy-Item -LiteralPath (Join-Path $driverSource 'serial\amd64\simlteusbser.sys') -Destination (Join-Path $driverDest 'serial\amd64') -Force
-
-.\scripts\validate-simcom-driver.ps1 -SourceZip $driverZip
+.\scripts\prepare-simcom-driver.ps1 -SourceZip 'D:\path\to\Windows10.zip'
 ```
+
+The script refuses an archive whose SHA-256 does not match `manifest.json`,
+extracts it to a unique temporary directory, copies only the six allowlisted x64
+files into the local staging directory, validates their hashes, catalog
+signatures, and hardware IDs, and removes the temporary extraction. It never
+copies the source ZIP into the repository.
 
 The resulting vendor payload must contain exactly this layout:
 
