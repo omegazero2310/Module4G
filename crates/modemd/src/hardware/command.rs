@@ -1,10 +1,10 @@
 use super::*;
 
-pub(super) fn result_confirms_liveness(result: &Result<Vec<String>, ModemError>) -> bool {
+pub(super) fn result_confirms_liveness<T>(result: &Result<T, ModemError>) -> bool {
     matches!(result, Ok(_) | Err(ModemError::CommandRejected(_)))
 }
 
-pub(super) fn result_requires_reconnect(result: &Result<Vec<String>, ModemError>) -> bool {
+pub(super) fn result_requires_reconnect<T>(result: &Result<T, ModemError>) -> bool {
     matches!(
         result,
         Err(ModemError::Disconnected
@@ -139,7 +139,7 @@ pub(super) fn execute_command(
                                 port.write_all(&[0x1a])
                                     .map_err(|_| ModemError::Disconnected)?;
                             }
-                            PayloadMode::Raw { .. } => {
+                            PayloadMode::Raw { .. } | PayloadMode::Download { .. } => {
                                 unreachable!("raw uploads use phased transfer")
                             }
                         }

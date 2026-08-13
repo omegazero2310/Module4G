@@ -61,7 +61,33 @@ pub struct AtRequest {
     /// interleaving with unrelated requests. The finalizer is always attempted.
     pub batch: Vec<String>,
     pub finalizer: Option<String>,
-    pub reply: tokio::sync::oneshot::Sender<Result<Vec<String>, ModemError>>,
+    pub reply: tokio::sync::oneshot::Sender<Result<AtResponse, ModemError>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AtResponse {
+    Lines(Vec<String>),
+    Data(Vec<u8>),
+}
+
+impl AtResponse {
+    pub fn into_lines(self) -> Result<Vec<String>, ModemError> {
+        match self {
+            Self::Lines(lines) => Ok(lines),
+            Self::Data(_) => Err(ModemError::Validation(
+                "modem returned binary data for a line command".into(),
+            )),
+        }
+    }
+
+    pub fn into_data(self) -> Result<Vec<u8>, ModemError> {
+        match self {
+            Self::Data(data) => Ok(data),
+            Self::Lines(_) => Err(ModemError::Validation(
+                "modem returned line data for a binary command".into(),
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -70,6 +96,9 @@ pub enum PayloadMode {
     Sms,
     Raw {
         pacing: Duration,
+    },
+    Download {
+        max_bytes: usize,
     },
 }
 

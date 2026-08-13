@@ -42,7 +42,7 @@ describe("SMS page", () => {
 
 describe("Calls page", () => {
   it("rejects non-AMR uploads and keeps dialing disabled without selected audio", async () => {
-    invokeMock.mockResolvedValue({ calls: [], audio: [] });
+    invokeMock.mockResolvedValue({ calls: [], audio: [], audioSyncState: "ready" });
     render(<Calls ready/>);
     expect(await screen.findByText("No audio uploaded. Dialing is disabled.")).toBeInTheDocument();
     const picker = document.querySelector('input[type="file"]') as HTMLInputElement;
@@ -50,6 +50,14 @@ describe("Calls page", () => {
     expect(screen.getByText("Select an AMR-NB file with an .amr extension.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Dial" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Hang Up" })).toBeDisabled();
+  });
+
+  it("shows modem synchronization and keeps call controls disabled until ready", async () => {
+    invokeMock.mockResolvedValue({ calls: [], audio: [], audioSyncState: "syncing" });
+    const view = render(<Calls ready/>);
+    expect(await within(view.container).findByText("Synchronizing audio from modem...")).toBeInTheDocument();
+    expect(within(view.container).getByRole("button", { name: "Upload audio" })).toBeDisabled();
+    expect(within(view.container).getByRole("button", { name: "Dial" })).toBeDisabled();
   });
 });
 

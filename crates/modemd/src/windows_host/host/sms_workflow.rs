@@ -326,5 +326,7 @@ pub(super) async fn actor_batch_lines(
         .await
         .map_err(|_| "modem command timed out".to_owned())?
         .map_err(|_| "modem command actor stopped".to_owned())?
+        .map_err(|e| e.to_string())?
+        .into_lines()
         .map_err(|e| e.to_string())
 }

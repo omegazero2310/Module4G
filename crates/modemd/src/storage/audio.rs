@@ -1,6 +1,21 @@
 use super::*;
 
 impl Store {
+    pub fn replace_audio_inventory(&self, audio: &[UploadedAudioRecord]) -> Result<(), ModemError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction().map_err(db_error)?;
+        transaction
+            .execute("DELETE FROM uploaded_audio", [])
+            .map_err(db_error)?;
+        for item in audio {
+            transaction.execute(
+                "INSERT INTO uploaded_audio(id,name,format,size,module_path,duration_ms,created_at_ms,is_current) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![item.id,item.name,item.format,item.size,item.module_path,item.duration_ms,item.created_at_ms,item.is_current],
+            ).map_err(db_error)?;
+        }
+        transaction.commit().map_err(db_error)
+    }
+
     pub fn current_audio(&self) -> Result<Option<UploadedAudioRecord>, ModemError> {
         self.connection()?
             .query_row(

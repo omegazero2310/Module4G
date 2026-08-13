@@ -18,7 +18,10 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::VecDeque,
     net::SocketAddr,
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -248,6 +251,7 @@ pub struct RestState {
     pub hardware_state: Arc<RwLock<HardwareState>>,
     pub dispatcher: Arc<dyn CommunicationDispatcher>,
     pub diagnostics: Arc<IntegrationDiagnostics>,
+    pub audio_catalog_ready: Arc<AtomicBool>,
 }
 
 pub fn router(state: RestState) -> Router {
@@ -511,6 +515,12 @@ async fn process_request(
             .map_err(|error| (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()))?;
     }
     let audio_id = if matches!(request.channel, Channel::Call) {
+        if !state.audio_catalog_ready.load(Ordering::Acquire) {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "audio catalog synchronization is not complete".into(),
+            ));
+        }
         let audio = if request.content.trim().is_empty() {
             state.store.current_audio().map_err(internal)?
         } else {
@@ -1036,7 +1046,7 @@ mod tests {
         }
     }
 
-    fn fixture() -> (Router, Arc<MockDispatcher>) {
+    fn fixture() -> (Router, Arc<MockDispatcher>, Arc<AtomicBool>) {
         let store = Arc::new(Store::memory().unwrap());
         let dispatcher = Arc::new(MockDispatcher {
             store: Arc::clone(&store),
@@ -1048,6 +1058,7 @@ mod tests {
             rest_token: "secret".into(),
             ..Default::default()
         }));
+        let audio_catalog_ready = Arc::new(AtomicBool::new(true));
         (
             router(RestState {
                 store,
@@ -1057,8 +1068,10 @@ mod tests {
                 })),
                 dispatcher: dispatcher.clone(),
                 diagnostics: Arc::new(IntegrationDiagnostics::new(false)),
+                audio_catalog_ready: Arc::clone(&audio_catalog_ready),
             }),
             dispatcher,
+            audio_catalog_ready,
         )
     }
 
@@ -1099,6 +1112,7 @@ mod tests {
             hardware_state: Arc::clone(&hardware_state),
             dispatcher,
             diagnostics: Arc::new(IntegrationDiagnostics::new(false)),
+            audio_catalog_ready: Arc::new(AtomicBool::new(true)),
         });
         (app, store, settings, hardware_state)
     }
@@ -1220,7 +1234,7 @@ mod tests {
 
     #[tokio::test]
     async fn requires_auth_and_preserves_nullable_error_data() {
-        let (app, _) = fixture();
+        let (app, _, _) = fixture();
         let response = app
             .oneshot(request(serde_json::json!({}), false))
             .await
@@ -1236,7 +1250,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_id_is_opaque_and_duplicates_are_rejected_without_redispatch() {
-        let (app, dispatcher) = fixture();
+        let (app, dispatcher, _) = fixture();
         let id = "caller-correlation/42";
         let payload = serde_json::json!({"request_id":id,"from":"desk","to":"0912345678","channel":"sms","content":"hello","encrypted":true,"send_at":null});
         let response = app
@@ -1276,7 +1290,7 @@ mod tests {
 
     #[tokio::test]
     async fn requires_non_empty_request_id_and_rejects_future_work_and_unknown_channel() {
-        let (app, _) = fixture();
+        let (app, _, _) = fixture();
         for payload in [
             serde_json::json!({"from":"desk","to":"0912345678","channel":"sms","content":"hello"}),
             serde_json::json!({"request_id":"","from":"desk","to":"0912345678","channel":"sms","content":"hello"}),
@@ -1296,7 +1310,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_call_content_uses_current_audio() {
-        let (app, dispatcher) = fixture();
+        let (app, dispatcher, _) = fixture();
         dispatcher
             .store
             .save_current_audio(&UploadedAudioRecord {
@@ -1324,6 +1338,21 @@ mod tests {
             dispatcher.store.list_calls(1).unwrap()[0].audio_id,
             "default-audio"
         );
+    }
+
+    #[tokio::test]
+    async fn call_is_unavailable_until_audio_catalog_is_ready() {
+        let (app, dispatcher, audio_catalog_ready) = fixture();
+        audio_catalog_ready.store(false, Ordering::Release);
+        let response = app
+            .oneshot(request(
+                serde_json::json!({"request_id":"pending-call","from":"desk","to":"0912345678","channel":"call","content":""}),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(dispatcher.calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

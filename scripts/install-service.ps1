@@ -26,6 +26,10 @@ if (-not (Test-Path -LiteralPath $Binary -PathType Leaf)) {
 $target = Join-Path $env:ProgramFiles 'A7670 Modem\modemd.exe'
 $data = Join-Path $env:ProgramData 'A7670 Modem'
 New-Item -ItemType Directory -Force (Split-Path $target), $data | Out-Null
+$aclOutput = & icacls.exe $data /grant '*S-1-5-19:(OI)(CI)M' /T /C 2>&1
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not grant LocalService access to ${data}.`n$($aclOutput -join [Environment]::NewLine)"
+}
 $existing = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
 if ($existing) {
     Invoke-Sc -Arguments @('stop', $serviceName) -AllowedExitCodes @(0, 1062)

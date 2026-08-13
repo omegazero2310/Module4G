@@ -43,8 +43,8 @@ use discovery::{candidate_sort_key, natural_port_key};
 pub use discovery::{discover_and_initialize, enumerate};
 use interactive::*;
 pub use types::{
-    AtRequest, HardwareError, HardwareState, InitializedModem, PayloadMode, PortCandidate,
-    SmsUrcEvent,
+    AtRequest, AtResponse, HardwareError, HardwareState, InitializedModem, PayloadMode,
+    PortCandidate, SmsUrcEvent,
 };
 
 /// Continuously discovers the modem and reports plug/unplug state changes.
@@ -76,23 +76,34 @@ pub fn monitor_with_commands(
                 Ok(request) => {
                     let port = modem.as_mut().expect("presence checked").port();
                     let result = if request.batch.is_empty() {
-                        execute_command(
-                            port,
-                            &request.command,
-                            request.payload.as_deref(),
-                            request.guarded,
-                            request.payload.as_ref().map_or_else(
-                                || command_timeout(&request.command),
-                                |_| {
-                                    payload_timeout(
-                                        request.payload.as_deref(),
-                                        request.payload_mode,
-                                    )
-                                },
-                            ),
-                            request.payload_mode,
-                            &mut dispatcher,
-                        )
+                        match request.payload_mode {
+                            PayloadMode::Download { max_bytes } => execute_raw_download(
+                                port,
+                                &request.command,
+                                max_bytes,
+                                RAW_RESULT_TIMEOUT,
+                                &mut dispatcher,
+                            )
+                            .map(AtResponse::Data),
+                            _ => execute_command(
+                                port,
+                                &request.command,
+                                request.payload.as_deref(),
+                                request.guarded,
+                                request.payload.as_ref().map_or_else(
+                                    || command_timeout(&request.command),
+                                    |_| {
+                                        payload_timeout(
+                                            request.payload.as_deref(),
+                                            request.payload_mode,
+                                        )
+                                    },
+                                ),
+                                request.payload_mode,
+                                &mut dispatcher,
+                            )
+                            .map(AtResponse::Lines),
+                        }
                     } else {
                         run_batch(&request.batch, request.finalizer.as_deref(), |command| {
                             execute_command(
@@ -105,6 +116,7 @@ pub fn monitor_with_commands(
                                 &mut dispatcher,
                             )
                         })
+                        .map(AtResponse::Lines)
                     };
                     publish_sms_events(&mut dispatcher, &sms_events);
                     if result_confirms_liveness(&result) {
@@ -441,14 +453,14 @@ mod tests {
                 resynchronized: true,
             },
         ] {
-            assert!(result_requires_reconnect(&Err(error)));
+            assert!(result_requires_reconnect::<()>(&Err(error)));
         }
-        assert!(!result_requires_reconnect(&Err(
+        assert!(!result_requires_reconnect::<()>(&Err(
             ModemError::CommandRejected("ERROR".into())
         )));
-        assert!(result_confirms_liveness(&Err(ModemError::CommandRejected(
-            "ERROR".into()
-        ))));
+        assert!(result_confirms_liveness::<()>(&Err(
+            ModemError::CommandRejected("ERROR".into())
+        )));
     }
 
     #[test]

@@ -47,6 +47,15 @@ Function ModemdStopBeforeInstall
 FunctionEnd
 
 Function ModemdInstallAndStart
+  CreateDirectory "$COMMONAPPDATA\A7670 Modem"
+  nsExec::ExecToStack '"$SYSDIR\icacls.exe" "$COMMONAPPDATA\A7670 Modem" /grant *S-1-5-19:(OI)(CI)M /T /C'
+  Pop $0
+  Pop $1
+  ${If} $0 != 0
+    MessageBox MB_OK|MB_ICONSTOP "Unable to grant LocalService access to retained modem data (icacls.exe exit code $0). Setup cannot safely start ${MODEMD_SERVICE}.$\r$\n$1"
+    Abort
+  ${EndIf}
+
   !insertmacro ModemdQueryService ""
   Pop $2
   ${If} $2 == 1

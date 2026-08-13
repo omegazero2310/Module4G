@@ -20,9 +20,12 @@ mod actor;
 mod audio_upload;
 mod lifecycle;
 mod release;
-use actor::{actor_batch_lines, actor_lines};
+use actor::{actor_batch_lines, actor_data, actor_lines};
 use audio_upload::*;
 use release::*;
+
+mod audio_sync;
+use audio_sync::*;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const RELEASE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
@@ -41,6 +44,30 @@ pub struct CallManager {
     settings: Arc<RwLock<Settings>>,
     active: Mutex<Option<ActiveCall>>,
     uploading: AtomicBool,
+    syncing: AtomicBool,
+    audio_gate: AsyncMutex<()>,
+    pending_audio_manifest: Mutex<Option<AudioManifest>>,
+    sync_state: RwLock<AudioSyncState>,
+    catalog_ready: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AudioSyncState {
+    Pending,
+    Syncing,
+    Ready,
+    Deferred,
+}
+
+impl AudioSyncState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Syncing => "syncing",
+            Self::Ready => "ready",
+            Self::Deferred => "deferred",
+        }
+    }
 }
 
 struct UploadGuard<'a>(&'a AtomicBool);
@@ -200,7 +227,9 @@ mod tests {
                     }
                     Vec::new()
                 };
-                let _ = request.reply.send(Ok(lines));
+                let _ = request
+                    .reply
+                    .send(Ok(crate::hardware::AtResponse::Lines(lines)));
                 if releasing && command == "AT+CLCC" {
                     break;
                 }
@@ -249,7 +278,9 @@ mod tests {
                     }
                     Vec::new()
                 };
-                let _ = request.reply.send(Ok(lines));
+                let _ = request
+                    .reply
+                    .send(Ok(crate::hardware::AtResponse::Lines(lines)));
                 if releasing && command == "AT+CLCC" {
                     break;
                 }
@@ -298,7 +329,9 @@ mod tests {
                     }
                     Ok(Vec::new())
                 };
-                let _ = request.reply.send(result);
+                let _ = request
+                    .reply
+                    .send(result.map(crate::hardware::AtResponse::Lines));
                 if releasing && command == "AT+CLCC" {
                     break;
                 }
@@ -333,7 +366,9 @@ mod tests {
                 } else {
                     Vec::new()
                 };
-                let _ = request.reply.send(Ok(lines));
+                let _ = request
+                    .reply
+                    .send(Ok(crate::hardware::AtResponse::Lines(lines)));
                 if release_attempts >= 2 && command == "AT+CLCC" {
                     break;
                 }
@@ -392,7 +427,8 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let actor_seen = Arc::clone(&seen);
         let actor = thread::spawn(move || {
-            for index in 0..4 {
+            let mut manifest_size = 0;
+            for index in 0..11 {
                 let request = rx.recv().unwrap();
                 actor_seen.lock().unwrap().push((
                     request.command.clone(),
@@ -410,10 +446,19 @@ mod tests {
                     })
                 } else if index == 3 {
                     Ok(vec!["+FSATTRI: 19".into()])
+                } else if (4..=7).contains(&index) {
+                    Err(ModemError::CommandRejected("ERROR".into()))
+                } else if index == 9 {
+                    manifest_size = request.payload.as_ref().map_or(0, Vec::len);
+                    Ok(Vec::new())
+                } else if index == 10 {
+                    Ok(vec![format!("+FSATTRI: {manifest_size}")])
                 } else {
                     Ok(Vec::new())
                 };
-                let _ = request.reply.send(result);
+                let _ = request
+                    .reply
+                    .send(result.map(crate::hardware::AtResponse::Lines));
             }
         });
         let mut amr = crate::audio::AMR_NB_MAGIC.to_vec();
@@ -425,7 +470,7 @@ mod tests {
         let seen = seen.lock().unwrap();
         let transfers: Vec<_> = seen
             .iter()
-            .filter(|(command, _, _)| command.starts_with("AT+CFTRANRX="))
+            .filter(|(command, _, _)| command.starts_with("AT+CFTRANRX=\"c:/call_"))
             .collect();
         assert_eq!(transfers.len(), 2);
         assert_ne!(transfers[0].0, transfers[1].0);
@@ -446,6 +491,11 @@ mod tests {
         assert!(!seen[1].2[1].contains("C:/"));
         assert_eq!(seen[3].2[0], "AT+FSCD=C:");
         assert!(seen[3].2[1].starts_with("AT+FSATTRI=\"call_"));
+        assert!(
+            seen[9]
+                .0
+                .starts_with("AT+CFTRANRX=\"c:/a7670_audio_1.txt\"")
+        );
         assert_eq!(store.list_audio().unwrap().len(), 2);
     }
 
@@ -463,7 +513,9 @@ mod tests {
                 } else {
                     Ok(Vec::new())
                 };
-                let _ = request.reply.send(response);
+                let _ = request
+                    .reply
+                    .send(response.map(crate::hardware::AtResponse::Lines));
             }
         });
         let mut amr = crate::audio::AMR_NB_MAGIC.to_vec();

@@ -45,7 +45,7 @@ pub(super) fn json_response(request: &str, state: &mut SimState) -> Option<Strin
         "list_audio" => serde_json::json!({"ok":true,"data":state.audio}),
         "get_call_data" => {
             advance_calls(state);
-            serde_json::json!({"ok":true,"data":{"calls":state.calls,"audio":state.audio}})
+            serde_json::json!({"ok":true,"data":{"calls":state.calls,"audio":state.audio,"audioSyncState":"ready"}})
         }
         "select_audio" => {
             let id = value

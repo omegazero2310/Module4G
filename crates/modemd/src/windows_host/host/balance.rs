@@ -39,7 +39,10 @@ pub(super) async fn run_actor(
         return "ERROR: modem command actor unavailable\n".into();
     }
     match tokio::time::timeout(Duration::from_secs(35), response).await {
-        Ok(Ok(Ok(lines))) => format!("{}\n", lines.join(" | ")),
+        Ok(Ok(Ok(response))) => match response.into_lines() {
+            Ok(lines) => format!("{}\n", lines.join(" | ")),
+            Err(error) => format!("ERROR: {error}\n"),
+        },
         Ok(Ok(Err(error))) => format!("ERROR: {error}\n"),
         Ok(Err(_)) => "ERROR: modem command actor stopped\n".into(),
         Err(_) => "ERROR: command timed out\n".into(),

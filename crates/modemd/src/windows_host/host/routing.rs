@@ -104,7 +104,10 @@ pub(super) async fn handle_client(
                         "ERROR: modem command actor unavailable\n".to_owned()
                     } else {
                         match tokio::time::timeout(Duration::from_secs(3), response).await {
-                            Ok(Ok(Ok(lines))) => format!("{}\n", lines.join("\r\n")),
+                            Ok(Ok(Ok(response))) => match response.into_lines() {
+                                Ok(lines) => format!("{}\n", lines.join("\r\n")),
+                                Err(error) => format!("ERROR: {error}\n"),
+                            },
                             Ok(Ok(Err(error))) => format!("ERROR: {error}\n"),
                             Ok(Err(_)) => "ERROR: modem command actor stopped\n".to_owned(),
                             Err(_) => "ERROR: command timed out\n".to_owned(),
@@ -190,9 +193,13 @@ pub(super) async fn handle_json(
         "get_call_data" => call_manager
             .list_calls(1000)
             .and_then(|calls| {
-                call_manager
-                    .list_audio()
-                    .map(|audio| serde_json::json!({"calls": calls, "audio": audio}))
+                call_manager.list_audio().map(|audio| {
+                    serde_json::json!({
+                        "calls": calls,
+                        "audio": audio,
+                        "audioSyncState": call_manager.audio_sync_state().as_str()
+                    })
+                })
             })
             .map_err(|e| e.to_string()),
         "select_audio" => call_manager
@@ -202,6 +209,7 @@ pub(super) async fn handle_json(
                     .and_then(|value| value.as_str())
                     .unwrap_or_default(),
             )
+            .await
             .map(|audio| serde_json::to_value(audio).unwrap())
             .map_err(|e| e.to_string()),
         "upload_audio" => upload_audio_json(value, call_manager)

@@ -201,6 +201,7 @@ pub(super) struct UploadedAudio {
 pub(super) struct CallData {
     pub(super) calls: Vec<Record>,
     pub(super) audio: Vec<UploadedAudio>,
+    pub(super) audio_sync_state: String,
 }
 
 impl Default for Record {

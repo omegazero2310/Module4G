@@ -49,6 +49,7 @@ pub(super) async fn get_call_data() -> Result<CallData, String> {
     Ok(CallData {
         calls: Vec::new(),
         audio: Vec::new(),
+        audio_sync_state: "ready".into(),
     })
 }
 #[cfg(not(windows))]

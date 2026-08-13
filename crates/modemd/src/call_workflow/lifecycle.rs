@@ -12,7 +12,31 @@ impl CallManager {
             settings,
             active: Mutex::new(None),
             uploading: AtomicBool::new(false),
+            syncing: AtomicBool::new(false),
+            audio_gate: AsyncMutex::new(()),
+            pending_audio_manifest: Mutex::new(None),
+            sync_state: RwLock::new(AudioSyncState::Pending),
+            catalog_ready: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn audio_sync_state(&self) -> AudioSyncState {
+        *self
+            .sync_state
+            .read()
+            .unwrap_or_else(|lock| lock.into_inner())
+    }
+
+    pub fn audio_catalog_ready(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.catalog_ready)
+    }
+
+    pub fn mark_audio_sync_pending(&self) {
+        self.catalog_ready.store(false, Ordering::Release);
+        *self
+            .sync_state
+            .write()
+            .unwrap_or_else(|lock| lock.into_inner()) = AudioSyncState::Pending;
     }
 
     pub fn current_audio(&self) -> Result<Option<UploadedAudioRecord>, ModemError> {
@@ -23,11 +47,25 @@ impl CallManager {
         self.store.list_audio()
     }
 
-    pub fn select_audio(&self, id: &str) -> Result<UploadedAudioRecord, ModemError> {
+    pub async fn select_audio(&self, id: &str) -> Result<UploadedAudioRecord, ModemError> {
         if self.call_active() || self.uploading.load(Ordering::Acquire) {
             return Err(ModemError::Busy);
         }
-        self.store.select_audio(id)
+        let _gate = self.audio_gate.lock().await;
+        let selected = self
+            .store
+            .list_audio()?
+            .into_iter()
+            .find(|audio| audio.id == id)
+            .ok_or_else(|| ModemError::Validation("audio file was not found".into()))?;
+        self.store.select_audio(id)?;
+        if let Err(error) = self.persist_selection_manifest(id).await {
+            eprintln!("audio manifest selection persistence deferred: {error}");
+        }
+        Ok(UploadedAudioRecord {
+            is_current: true,
+            ..selected
+        })
     }
 
     pub fn settings(&self) -> Settings {
@@ -59,7 +97,9 @@ impl CallManager {
     }
 
     pub fn sms_sync_allowed(&self) -> bool {
-        !self.call_active() && !self.uploading.load(Ordering::Acquire)
+        !self.call_active()
+            && !self.uploading.load(Ordering::Acquire)
+            && !self.syncing.load(Ordering::Acquire)
     }
 
     pub async fn upload_audio(
@@ -74,6 +114,7 @@ impl CallManager {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| ModemError::Busy)?;
         let _guard = UploadGuard(&self.uploading);
+        let _audio_gate = self.audio_gate.lock().await;
         if self.call_active() {
             return Err(ModemError::Busy);
         }
@@ -122,7 +163,7 @@ impl CallManager {
             let retry_result = actor_lines(
                 &self.command_tx,
                 format!("AT+CFTRANRX=\"{target_path}\",{}", data.len()),
-                Some(data),
+                Some(data.clone()),
                 PayloadMode::Raw {
                     pacing: configured_pacing.max(Duration::from_millis(50)),
                 },
@@ -154,14 +195,14 @@ impl CallManager {
             state: "ready".into(),
             is_current: true,
         };
-        if let Some(previous) = replaced.as_ref() {
-            if module_path(&previous.id).as_deref() == Ok(previous.module_path.as_str()) {
-                let previous_name = module_filename(&previous.id)?;
-                if let Err(error) = delete_module_file(&self.command_tx, &previous_name).await {
-                    let _ = delete_module_file(&self.command_tx, &target_name).await;
-                    return Err(upload_stage_error("replacement cleanup", error));
-                }
-            }
+        if replaced
+            .as_ref()
+            .is_some_and(|old| !is_managed_path(&old.module_path))
+        {
+            let _ = delete_module_file(&self.command_tx, &target_name).await;
+            return Err(ModemError::Validation(
+                "an external modem audio file already uses that name".into(),
+            ));
         }
         if let Err(error) = self
             .store
@@ -169,6 +210,21 @@ impl CallManager {
         {
             let _ = delete_module_file(&self.command_tx, &target_name).await;
             return Err(error);
+        }
+        if let Err(error) = self
+            .persist_uploaded_manifest(&audio, replaced.as_ref(), &data)
+            .await
+        {
+            eprintln!("audio manifest upload persistence deferred: {error}");
+        }
+        if let Some(previous) = replaced.as_ref() {
+            if is_managed_path(&previous.module_path) {
+                if let Some(previous_name) = previous.module_path.rsplit('/').next() {
+                    if let Err(error) = delete_module_file(&self.command_tx, previous_name).await {
+                        eprintln!("audio replacement cleanup deferred: {error}");
+                    }
+                }
+            }
         }
         Ok(audio)
     }
@@ -191,15 +247,19 @@ impl CallManager {
         if self.uploading.load(Ordering::Acquire) {
             return Err(ModemError::Busy);
         }
+        let _audio_gate = self.audio_gate.lock().await;
         let audio = self
             .store
             .current_audio()?
             .filter(|audio| audio.id == audio_id)
             .ok_or_else(|| ModemError::Validation("select the current uploaded audio".into()))?;
-        if module_path(&audio.id).as_deref() != Ok(audio.module_path.as_str()) {
+        if !is_safe_audio_path(&audio.module_path) {
             return Err(ModemError::Validation(
                 "current audio has an invalid modem path".into(),
             ));
+        }
+        if self.audio_sync_state() == AudioSyncState::Ready {
+            verify_module_audio(&self.command_tx, &audio).await?;
         }
         let record = CallRecord {
             id,

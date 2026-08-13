@@ -5,6 +5,7 @@ pub mod host {
     mod sms_workflow;
     use balance::*;
     use modemd::{
+        ModemError,
         call_workflow::CallManager,
         hardware::{self, PayloadMode},
         integration::{self, CommunicationDispatcher, DispatchError, RestState},
@@ -250,6 +251,7 @@ pub mod host {
             hardware_state: Arc::clone(&device_state),
             dispatcher: rest_dispatcher,
             diagnostics: Arc::clone(&integration_diagnostics),
+            audio_catalog_ready: call_manager.audio_catalog_ready(),
         };
         let bind_address = integration_settings
             .read()
@@ -285,7 +287,10 @@ pub mod host {
         let sync_device_state = Arc::clone(&device_state);
         let sms_synchronizer = tokio::spawn(async move {
             let mut next_reconciliation = tokio::time::Instant::now();
+            let mut next_audio_reconciliation = tokio::time::Instant::now();
+            let mut next_audio_manifest_attempt = tokio::time::Instant::now();
             let mut next_configuration_attempt = tokio::time::Instant::now();
+            let mut was_modem_ready = false;
             let mut stored_event_due = None;
             let mut pending_direct_reports = Vec::new();
             loop {
@@ -296,6 +301,42 @@ pub mod host {
                         .unwrap_or_else(|lock| lock.into_inner()),
                     hardware::HardwareState::Ready { .. }
                 );
+                if modem_ready && !was_modem_ready {
+                    sync_calls.mark_audio_sync_pending();
+                    next_audio_reconciliation = current;
+                } else if !modem_ready && was_modem_ready {
+                    sync_calls.mark_audio_sync_pending();
+                }
+                was_modem_ready = modem_ready;
+                if modem_ready
+                    && sync_calls.sms_sync_allowed()
+                    && current >= next_audio_manifest_attempt
+                {
+                    if let Err(error) = sync_calls.retry_pending_audio_manifest().await {
+                        if !matches!(error, ModemError::Busy) {
+                            eprintln!("audio manifest background persistence deferred: {error}");
+                        }
+                    }
+                    next_audio_manifest_attempt =
+                        tokio::time::Instant::now() + Duration::from_secs(10);
+                }
+                if modem_ready
+                    && sync_calls.sms_sync_allowed()
+                    && current >= next_audio_reconciliation
+                {
+                    match sync_calls.reconcile_audio().await {
+                        Ok(count) => {
+                            eprintln!("audio catalog synchronized entries={count}");
+                            next_audio_reconciliation =
+                                tokio::time::Instant::now() + Duration::from_secs(300);
+                        }
+                        Err(error) => {
+                            eprintln!("automatic audio synchronization deferred: {error}");
+                            next_audio_reconciliation =
+                                tokio::time::Instant::now() + Duration::from_secs(10);
+                        }
+                    }
+                }
                 let needs_configuration = {
                     let capability = sync_capability
                         .read()
@@ -437,6 +478,7 @@ pub mod host {
         ) -> Result<(), DispatchError> {
             self.call_manager
                 .select_audio(&audio_id)
+                .await
                 .map_err(|error| match error {
                     modemd::ModemError::Validation(message) => DispatchError::Validation(message),
                     _ => DispatchError::Unavailable(error.to_string()),
@@ -519,6 +561,8 @@ pub mod host {
             .await
             .map_err(|_| "modem command timed out".to_owned())?
             .map_err(|_| "modem command actor stopped".to_owned())?
+            .map_err(|e| e.to_string())?
+            .into_lines()
             .map_err(|e| e.to_string())
     }
 

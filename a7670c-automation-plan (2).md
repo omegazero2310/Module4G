@@ -86,6 +86,9 @@ AT+CCMXPLAY="c:/msg.amr",1,0   # play_path=1 = remote path (voice call), repeat=
 ```
 - URCs mark playback boundaries: `+AUDIOSTATE: audio play` / `+AUDIOSTATE: audio play stop`.
 - Stop early: `AT+CCMXSTOP`.
+- The module filesystem is the authority for playable audio. When the modem becomes ready, after reconnect, and every five minutes while idle, the service lists `C:/` with `AT+FSLS=2`, validates unknown `.amr` files by downloading them with `AT+CFTRANTX`, and reconciles the SQLite audio library.
+- Two alternating `a7670_audio_<slot>.txt` manifests retain names, durations, hashes, ownership, and the current selection across deployment to a clean PC; legacy `.json` slots remain readable. Manifest writes are non-fatal metadata follow-ups retried every 10 seconds, so the SQLite catalog and calls remain usable when firmware rejects a manifest upload. If a legacy module has no manifest, the newest valid `call_<ULID>.amr` becomes current; otherwise the first valid AMR in deterministic filename order is selected.
+- External AMR files are selectable but read-only. Invalid or oversized files remain on the module and are not exposed for calls. A call verifies the selected file size immediately before dialing.
 - This plays directly into the call audio path — no need for the CM108 analog injection card on this module; switch over for cleaner audio and one less physical component.
 
 Reference: §13.2.1, §12.2.5 (FSDEL), §21.2.1, §21.2.2
