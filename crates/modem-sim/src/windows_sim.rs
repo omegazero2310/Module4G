@@ -1,5 +1,6 @@
 #[cfg(windows)]
 pub mod host {
+    mod balance;
     mod json;
     mod legacy;
     mod pipe;
@@ -18,6 +19,75 @@ pub mod host {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn balance_operations_are_deterministic_idempotent_and_recoverable() {
+            let mut state = SimState::default();
+            let query = |request: serde_json::Value, state: &mut SimState| -> serde_json::Value {
+                serde_json::from_str(&json_response(&request.to_string(), state).unwrap()).unwrap()
+            };
+            let start = serde_json::json!({"command":"start_balance_check","request_id":"key"});
+            let first = query(start.clone(), &mut state);
+            assert_eq!(first["data"]["id"], "sim-balance-check-1");
+            assert_eq!(query(start, &mut state)["data"]["id"], first["data"]["id"]);
+            let get = serde_json::json!({"command":"get_balance_check","id":"sim-balance-check-1"});
+            for _ in 0..3 {
+                query(get.clone(), &mut state);
+            }
+            let latest = query(
+                serde_json::json!({"command":"get_latest_balance"}),
+                &mut state,
+            );
+            assert_eq!(latest["data"]["balance"]["amount_vnd"], 85500);
+            assert_eq!(latest["data"]["active_check_id"], serde_json::Value::Null);
+        }
+
+        #[test]
+        fn balance_simulator_covers_zero_timeout_and_unknown_submission() {
+            for scenario in [
+                "zero",
+                "timeout",
+                "send-unknown",
+                "malformed",
+                "unrelated",
+                "ambiguous",
+            ] {
+                let mut state = SimState::default();
+                json_response(
+                    &serde_json::json!({"command":"set_balance_scenario","scenario":scenario})
+                        .to_string(),
+                    &mut state,
+                )
+                .unwrap();
+                json_response(
+                    r#"{"command":"start_balance_check","request_id":"key"}"#,
+                    &mut state,
+                )
+                .unwrap();
+                let mut last = serde_json::Value::Null;
+                for _ in 0..4 {
+                    last = serde_json::from_str(
+                        &json_response(
+                            r#"{"command":"get_balance_check","id":"sim-balance-check-1"}"#,
+                            &mut state,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                }
+                assert_eq!(
+                    last["data"]["status"],
+                    if scenario == "zero" {
+                        "succeeded"
+                    } else {
+                        "timed_out"
+                    }
+                );
+                if scenario == "zero" {
+                    assert_eq!(last["data"]["balance"]["amount_vnd"], 0);
+                }
+            }
+        }
 
         #[test]
         fn legacy_routes_preserve_exact_status_and_sms_shapes() {

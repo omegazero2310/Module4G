@@ -114,6 +114,9 @@ pub fn run() {
             call_handlers::hang_up,
             call_handlers::list_calls,
             balance_handlers::check_balance,
+            balance_handlers::start_balance_check,
+            balance_handlers::get_balance_check,
+            balance_handlers::get_latest_balance,
             balance_handlers::list_balance_checks
         ])
         .run(tauri::generate_context!())

@@ -88,7 +88,12 @@ pub(super) fn suppress_successful_poll_log(request: &str) -> bool {
                 .map(|command| {
                     matches!(
                         command,
-                        "list_calls" | "get_current_audio" | "list_audio" | "get_call_data"
+                        "list_calls"
+                            | "get_current_audio"
+                            | "list_audio"
+                            | "get_call_data"
+                            | "get_latest_balance"
+                            | "get_balance_check"
                     )
                 })
         })

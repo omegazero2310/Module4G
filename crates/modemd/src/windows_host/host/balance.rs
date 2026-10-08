@@ -1,20 +1,40 @@
 use super::*;
 
 pub(super) async fn balance_json(
-    tx: &mpsc::Sender<hardware::AtRequest>,
-    store: &Store,
+    service: &Arc<modemd::balance::BalanceService>,
 ) -> Result<BalanceRecord, String> {
-    let (raw, sms_id) = check_viettel_balance(tx, store).await?;
-    let stamp = now();
-    let b = BalanceRecord {
-        id: ulid::Ulid::new().to_string(),
-        raw,
-        created_at_ms: stamp,
-        sms_id,
-        ..Default::default()
+    use modemd::balance::BalanceReservation;
+    let check = match service
+        .start(&uuid::Uuid::new_v4().to_string())
+        .map_err(|_| "Balance check could not be started.")?
+    {
+        BalanceReservation::New(check) | BalanceReservation::Replay(check) => check,
+        _ => return Err("Balance check unavailable, active, or cooling down.".into()),
     };
-    store.save_balance(&b).map_err(|e| e.to_string())?;
-    Ok(b)
+    loop {
+        let current = service
+            .store
+            .balance_check(&check.id)
+            .map_err(|_| "Balance check could not be read.")?
+            .ok_or("Balance check not found.")?;
+        match current.status.as_str() {
+            "succeeded" => {
+                return service
+                    .store
+                    .list_balances(1000)
+                    .map_err(|_| "Balance history could not be read.".to_owned())?
+                    .into_iter()
+                    .find(|record| record.id == check.id)
+                    .ok_or_else(|| "Balance result not found.".into());
+            }
+            "failed" | "timed_out" => {
+                return Err(current
+                    .failure_reason
+                    .unwrap_or_else(|| "Balance check failed.".into()));
+            }
+            _ => tokio::time::sleep(Duration::from_millis(500)).await,
+        }
+    }
 }
 
 pub(super) async fn run_actor(
@@ -72,52 +92,7 @@ pub(super) fn is_transient_call_release_error(response: &str) -> bool {
     response.contains("+cme error:") && response.contains("operation not allowed")
 }
 
-pub(super) async fn check_viettel_balance(
-    command_tx: &mpsc::Sender<hardware::AtRequest>,
-    store: &Store,
-) -> Result<(String, String), String> {
-    use std::collections::HashSet;
-    let baseline = actor_pdu_snapshot(command_tx).await?;
-    let baseline_records = snapshot_records(modemd::sms::parse_cmgl(&baseline), now());
-    let persisted_baseline = store
-        .list_sms(usize::MAX)
-        .map_err(|error| error.to_string())?;
-    let identities: HashSet<String> = persisted_baseline
-        .iter()
-        .chain(&baseline_records)
-        .map(|record| record.fingerprint.clone())
-        .collect();
-
-    let submitted = actor_lines(command_tx, "AT+CMGS=\"191\"".into(), Some(b"TK".to_vec())).await?;
-    if !submitted.iter().any(|line| line.starts_with("+CMGS:")) {
-        return Err("modem returned OK without accepting the TK submission".into());
-    }
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    while tokio::time::Instant::now() < deadline {
-        match actor_pdu_snapshot(command_tx).await {
-            Ok(lines) => {
-                let stamp = now();
-                let records = snapshot_records(modemd::sms::parse_cmgl(&lines), stamp);
-                if find_balance_candidate(&records, &identities).is_some() {
-                    store
-                        .sync_sms(&records, stamp)
-                        .map_err(|error| error.to_string())?;
-                }
-            }
-            Err(error) => return Err(error),
-        }
-        if let Some(message) = find_persisted_balance_candidate(store, &identities)? {
-            return Ok((message.body, message.id));
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-    if let Some(message) = find_persisted_balance_candidate(store, &identities)? {
-        return Ok((message.body, message.id));
-    }
-    Err("timed out waiting for a new complete Viettel balance SMS from 191".into())
-}
-
+#[cfg(test)]
 pub(super) fn find_persisted_balance_candidate(
     store: &Store,
     baseline: &std::collections::HashSet<String>,
@@ -128,6 +103,7 @@ pub(super) fn find_persisted_balance_candidate(
     Ok(find_balance_candidate(&records, baseline).cloned())
 }
 
+#[cfg(test)]
 pub(super) fn find_balance_candidate<'a>(
     records: &'a [SmsRecord],
     baseline: &std::collections::HashSet<String>,
@@ -141,6 +117,7 @@ pub(super) fn find_balance_candidate<'a>(
     })
 }
 
+#[cfg(test)]
 pub(super) fn is_viettel_balance_body(body: &str) -> bool {
     let folded = body
         .to_lowercase()

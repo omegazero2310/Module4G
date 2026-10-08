@@ -1,4 +1,6 @@
 :root { font: 15px Inter, "Segoe UI", sans-serif; color: #dce7e5; background: #091312; }
+.balance-actions { display:flex; gap:8px; flex-wrap:wrap }
+@media(max-width:600px) { .balance-heading { flex-direction:column; align-items:flex-start } }
 * { box-sizing: border-box } body { margin: 0 } button { font: inherit }
 .shell { display: grid; grid-template-columns: 230px 1fr; min-height: 100vh }
 aside { padding: 30px 20px; background: #0d1b19; border-right: 1px solid #20302d }

@@ -1,5 +1,7 @@
 # A7670C-LANS Automation — System Plan
 
+Implementation update (2026-10-08): the current Viettel balance flow uses the existing `TK` SMS to `191`, shared by REST/UI through durable SQLite operations. Clients start with `POST /api/v1/balance-checks`, poll `GET /api/v1/balance-checks/{id}`, and read `GET /api/v1/balance`; all require the existing bearer authentication. The earlier USSD proposal below remains historical context and is not substituted for this SMS flow. See `docs.md` for the implemented contract and `a7670c-sms-send-delivery-status.md` for pending physical acceptance. No installed-SIM balance or carrier format has been physically verified in this implementation session.
+
 Manual verified against: `A76XX-Series_AT_Command_Manual_V1_06-4.pdf`
 
 ## 1. Architecture

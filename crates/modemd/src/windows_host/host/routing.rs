@@ -26,6 +26,7 @@ pub(super) async fn handle_client(
                 &delivery_configuration,
                 &integration_settings,
                 &integration_diagnostics,
+                &context.balance_service,
             )
             .await
         } else if request == "STATUS" {
@@ -63,8 +64,8 @@ pub(super) async fn handle_client(
                 (_, None) => "ERROR: invalid SMS payload\n".into(),
             }
         } else if request == "BALANCE" {
-            match check_viettel_balance(&command_tx, &store).await {
-                Ok((body, _)) => format!("{body}\n"),
+            match balance_json(&context.balance_service).await {
+                Ok(record) => format!("{}\n", record.raw),
                 Err(error) => format!("ERROR: {error}\n"),
             }
         } else if let Some(code) = request.strip_prefix("USSD|") {
@@ -134,6 +135,7 @@ pub(super) async fn handle_json(
     delivery_configuration: &Arc<tokio::sync::Mutex<()>>,
     integration_settings: &Arc<RwLock<IntegrationSettings>>,
     integration_diagnostics: &Arc<modemd::integration::IntegrationDiagnostics>,
+    balance_service: &Arc<modemd::balance::BalanceService>,
 ) -> String {
     let value: serde_json::Value = match serde_json::from_str(request) {
         Ok(v) => v,
@@ -179,9 +181,49 @@ pub(super) async fn handle_json(
         "sync_sms" => sync_sms_json(tx, store)
             .await
             .map(|x| serde_json::json!({"count":x})),
-        "check_balance" => balance_json(tx, store)
+        "check_balance" => balance_json(balance_service)
             .await
             .map(|x| serde_json::to_value(x).unwrap()),
+        "start_balance_check" => {
+            use modemd::balance::{BalanceCheckData, BalanceReservation};
+            match balance_service.start(
+                value
+                    .get("request_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+            ) {
+                Ok(BalanceReservation::New(check) | BalanceReservation::Replay(check)) => {
+                    Ok(serde_json::to_value(BalanceCheckData::from(check)).unwrap())
+                }
+                Ok(BalanceReservation::Active(_)) => {
+                    Err("A balance check is already active. Refresh to view its progress.".into())
+                }
+                Ok(BalanceReservation::Cooldown(ms)) => Err(format!(
+                    "Wait {} seconds before another balance check.",
+                    (ms + 999) / 1000
+                )),
+                Ok(BalanceReservation::Unavailable) => Err("Modem is unavailable.".into()),
+                Err(_) => Err(
+                    "Balance check could not be started; request_id must contain 1 to 256 bytes."
+                        .into(),
+                ),
+            }
+        }
+        "get_balance_check" => store
+            .balance_check(value.get("id").and_then(|v| v.as_str()).unwrap_or_default())
+            .map_err(|_| "Balance check could not be read.".to_owned())
+            .and_then(|check| {
+                check
+                    .map(|check| {
+                        serde_json::to_value(modemd::balance::BalanceCheckData::from(check))
+                            .unwrap()
+                    })
+                    .ok_or_else(|| "Balance check not found.".into())
+            }),
+        "get_latest_balance" => store
+            .latest_balance(now())
+            .map(|data| serde_json::to_value(data).unwrap())
+            .map_err(|_| "Latest balance could not be read.".into()),
         "get_current_audio" => call_manager
             .current_audio()
             .map(|audio| serde_json::to_value(audio).unwrap())

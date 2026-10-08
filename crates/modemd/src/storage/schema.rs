@@ -176,6 +176,11 @@ impl Store {
              CREATE UNIQUE INDEX IF NOT EXISTS rest_communications_request_id ON rest_communications(request_id);
              INSERT OR IGNORE INTO schema_migrations(version) VALUES (10);",
         ).map_err(db_error)?;
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS balance_operations(id TEXT PRIMARY KEY,request_id TEXT NOT NULL UNIQUE,status TEXT NOT NULL,json TEXT NOT NULL,reply_sms_id TEXT UNIQUE);
+             CREATE UNIQUE INDEX IF NOT EXISTS balance_one_active ON balance_operations((1)) WHERE status IN ('queued','sending','waiting_reply','send_unknown');
+             INSERT OR IGNORE INTO schema_migrations(version) VALUES(11);"
+        ).map_err(db_error)?;
         Ok(())
     }
 }

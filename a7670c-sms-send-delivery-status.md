@@ -1,5 +1,11 @@
 # A7670C-LANS — SMS Send & Delivery Status (AT Command Reference)
 
+## Balance workflow update — 2026-10-08
+
+REST/UI balance checks now use the existing serialized SMS submission workflow to send `TK` to `191`, with durable idempotent operations and a 120-second reply deadline from dispatch. Submission confirmation is distinct from balance completion. Normal synchronization commits carrier SMS before exact-slot archival; only a conservatively correlated complete reply with a parsed main monetary balance completes the operation. No communication lifecycle webhooks are created for balance queries. Unknown submission is retained across restart and is never automatically resent.
+
+Software checks and simulator fixtures are not physical acceptance evidence. Pending acceptance: confirm installed SIM/account type and carrier reply format, record modem model/COM/ATI/CGMR and CPMS/CSMP/CNMI readbacks, compare the parsed main balance with a carrier source, and exercise service restart after submission, carrier silence, old/unrelated/late replies, concurrent REST/UI requests, and reply receipt during a call. Preserve private payloads outside Git. See `docs.md` for API calls and limits, including the SIM identity and late-reply caveats.
+
 Source: `A76XX Series_AT Command Manual_V1.06`, §9.1–9.2 (SMS commands), plus GSM 03.40 (3GPP TS 23.040) for PDU-level encoding the SimCom manual doesn't spell out itself.
 
 Two independent things need checking: **(1) was it accepted by the network**, **(2) was it delivered to the handset**. They use different mechanisms and arrive at different times — sometimes seconds, sometimes minutes apart.

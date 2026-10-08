@@ -4,6 +4,11 @@ pub(super) fn json_response(request: &str, state: &mut SimState) -> Option<Strin
     let value: serde_json::Value = serde_json::from_str(request.trim()).ok()?;
     let command = value.get("command")?.as_str()?;
     let result = match command {
+        "start_balance_check"
+        | "get_balance_check"
+        | "get_latest_balance"
+        | "set_balance_scenario"
+        | "list_balances" => balance::response(command, &value, state),
         "get_settings" => {
             serde_json::json!({"ok":true,"data":state.settings.clone().unwrap_or_else(|| serde_json::json!({
                 "usb_vid":7694,"usb_pid":36881,"port_override":null,"baud":115200,

@@ -70,6 +70,7 @@ pub mod host {
         call_manager: Arc<CallManager>,
         integration_settings: Arc<RwLock<IntegrationSettings>>,
         integration_diagnostics: Arc<integration::IntegrationDiagnostics>,
+        balance_service: Arc<modemd::balance::BalanceService>,
     }
 
     define_windows_service!(ffi_service_main, service_main);
@@ -169,6 +170,9 @@ pub mod host {
             .recover_interrupted_calls(now())
             .map_err(io::Error::other)?;
         let _ = store.recover_interrupted_sms().map_err(io::Error::other)?;
+        store
+            .recover_balance_checks(now())
+            .map_err(io::Error::other)?;
         let settings = Arc::new(RwLock::new(
             store.load_settings().map_err(io::Error::other)?,
         ));
@@ -228,6 +232,19 @@ pub mod host {
             Arc::clone(&store),
             Arc::clone(&settings),
         ));
+        let rest_dispatcher: Arc<dyn CommunicationDispatcher> = Arc::new(HostDispatcher {
+            command_tx: command_tx.clone(),
+            store: Arc::clone(&store),
+            call_manager: Arc::clone(&call_manager),
+            delivery_capability: Arc::clone(&delivery_capability),
+            delivery_configuration: Arc::clone(&delivery_configuration),
+        });
+        let balance_service = Arc::new(modemd::balance::BalanceService::new(
+            Arc::clone(&store),
+            Arc::clone(&rest_dispatcher),
+            Arc::clone(&device_state),
+        ));
+        let balance_worker = tokio::spawn(Arc::clone(&balance_service).run());
         let context = Arc::new(RuntimeContext {
             device_state: Arc::clone(&device_state),
             delivery_capability: Arc::clone(&delivery_capability),
@@ -237,13 +254,7 @@ pub mod host {
             call_manager: Arc::clone(&call_manager),
             integration_settings: Arc::clone(&integration_settings),
             integration_diagnostics: Arc::clone(&integration_diagnostics),
-        });
-        let rest_dispatcher: Arc<dyn CommunicationDispatcher> = Arc::new(HostDispatcher {
-            command_tx: command_tx.clone(),
-            store: Arc::clone(&store),
-            call_manager: Arc::clone(&call_manager),
-            delivery_capability: Arc::clone(&delivery_capability),
-            delivery_configuration: Arc::clone(&delivery_configuration),
+            balance_service: Arc::clone(&balance_service),
         });
         let rest_state = RestState {
             store: Arc::clone(&store),
@@ -287,6 +298,7 @@ pub mod host {
         let sync_device_state = Arc::clone(&device_state);
         let sms_synchronizer = tokio::spawn(async move {
             let mut next_reconciliation = tokio::time::Instant::now();
+            let mut next_balance_sync = tokio::time::Instant::now();
             let mut next_audio_reconciliation = tokio::time::Instant::now();
             let mut next_audio_manifest_attempt = tokio::time::Instant::now();
             let mut next_configuration_attempt = tokio::time::Instant::now();
@@ -396,13 +408,25 @@ pub mod host {
                 }
                 pending_direct_reports = retry_reports;
                 let event_due = stored_event_due.is_some_and(|due| current >= due);
-                if sync_calls.sms_sync_allowed() && (current >= next_reconciliation || event_due) {
+                let balance_due = current >= next_balance_sync
+                    && sync_store
+                        .active_balance_check()
+                        .ok()
+                        .flatten()
+                        .is_some_and(|check| {
+                            matches!(check.status.as_str(), "waiting_reply" | "send_unknown")
+                        });
+                if modem_ready
+                    && sync_calls.sms_sync_allowed()
+                    && (current >= next_reconciliation || event_due || balance_due)
+                {
                     if let Err(error) = sync_sms_json(&sync_tx, &sync_store).await {
                         eprintln!("automatic SMS synchronization deferred: {error}");
                     }
                     let _ = sync_store.expire_delivery_reports(now());
                     next_reconciliation = tokio::time::Instant::now() + Duration::from_secs(300);
                     stored_event_due = None;
+                    next_balance_sync = tokio::time::Instant::now() + Duration::from_secs(2);
                 }
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
@@ -420,6 +444,7 @@ pub mod host {
                     sms_synchronizer.abort();
                     rest_listener.abort();
                     webhook_worker.abort();
+                    balance_worker.abort();
                     monitor_stop.store(true, Ordering::Relaxed);
                     monitor.await.map_err(io::Error::other)?;
                     return Ok(());
@@ -449,6 +474,17 @@ pub mod host {
 
     #[async_trait::async_trait]
     impl CommunicationDispatcher for HostDispatcher {
+        async fn prepare_balance_check(&self) -> Result<(), DispatchError> {
+            if !self.call_manager.sms_sync_allowed() {
+                return Err(DispatchError::Unavailable("modem is busy".into()));
+            }
+            sync_sms_json(&self.command_tx, &self.store)
+                .await
+                .map(|_| ())
+                .map_err(|_| {
+                    DispatchError::Unavailable("balance inbox synchronization deferred".into())
+                })
+        }
         async fn send_sms(
             &self,
             id: String,

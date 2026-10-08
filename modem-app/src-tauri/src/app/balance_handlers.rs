@@ -1,5 +1,51 @@
 use super::*;
 
+#[tauri::command]
+pub(super) async fn start_balance_check(
+    request_id: String,
+) -> Result<modemd::balance::BalanceCheckData, String> {
+    #[cfg(windows)]
+    {
+        request_json(serde_json::json!({"command":"start_balance_check","request_id":request_id}))
+            .await
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = request_id;
+        Err("Balance checks are available only on Windows.".into())
+    }
+}
+#[tauri::command]
+pub(super) async fn get_balance_check(
+    id: String,
+) -> Result<modemd::balance::BalanceCheckData, String> {
+    #[cfg(windows)]
+    {
+        request_json(serde_json::json!({"command":"get_balance_check","id":id})).await
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = id;
+        Err("Balance checks are available only on Windows.".into())
+    }
+}
+#[tauri::command]
+pub(super) async fn get_latest_balance() -> Result<modemd::balance::LatestBalance, String> {
+    #[cfg(windows)]
+    {
+        request_json(serde_json::json!({"command":"get_latest_balance"})).await
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(modemd::balance::LatestBalance {
+            balance: None,
+            freshness: "unavailable".into(),
+            active_check_id: None,
+            retry_after_seconds: 0,
+        })
+    }
+}
+
 #[cfg(windows)]
 #[tauri::command]
 pub(super) async fn check_balance(_state: tauri::State<'_, AppState>) -> Result<Record, String> {

@@ -2,6 +2,7 @@
 
 pub mod at;
 pub mod audio;
+pub mod balance;
 pub mod call;
 pub mod call_workflow;
 pub mod hardware;

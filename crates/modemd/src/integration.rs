@@ -26,6 +26,7 @@ use std::{
 };
 
 pub const DEFAULT_WEBHOOK_URL: &str = "http://10.1.11.117:5068/api/v1/webhooks/receive";
+mod balance_api;
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
 pub const INTEGRATION_DIAGNOSTICS_CAPACITY: usize = 200;
 
@@ -230,6 +231,9 @@ pub enum DispatchError {
 
 #[async_trait]
 pub trait CommunicationDispatcher: Send + Sync {
+    async fn prepare_balance_check(&self) -> Result<(), DispatchError> {
+        Ok(())
+    }
     async fn send_sms(
         &self,
         id: String,
@@ -258,6 +262,9 @@ pub fn router(state: RestState) -> Router {
     Router::new()
         .route("/api/v1/health", get(get_health))
         .route("/api/v1/communications", post(post_communication))
+        .route("/api/v1/balance-checks", post(balance_api::start))
+        .route("/api/v1/balance-checks/{id}", get(balance_api::get_check))
+        .route("/api/v1/balance", get(balance_api::latest))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
@@ -1123,6 +1130,150 @@ mod tests {
             builder = builder.header(header::AUTHORIZATION, "Bearer secret");
         }
         builder.body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn balance_routes_authenticate_reserve_replay_and_report_without_webhooks() {
+        let (app, dispatcher, _) = fixture();
+        let build = |path: &str, method: &str, body: serde_json::Value, auth: bool| {
+            let mut builder = Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/json");
+            if auth {
+                builder = builder.header(header::AUTHORIZATION, "Bearer secret");
+            }
+            builder.body(Body::from(body.to_string())).unwrap()
+        };
+        for (path, method) in [
+            ("/api/v1/balance", "GET"),
+            ("/api/v1/balance-checks/missing", "GET"),
+            ("/api/v1/balance-checks", "POST"),
+        ] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(build(
+                        path,
+                        method,
+                        serde_json::json!({"request_id":"key"}),
+                        false
+                    ))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        let response = app
+            .clone()
+            .oneshot(build(
+                "/api/v1/balance-checks",
+                "POST",
+                serde_json::json!({"request_id":"key"}),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let json: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), MAX_BODY_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let id = json["data"]["id"].as_str().unwrap();
+        let replay = app
+            .clone()
+            .oneshot(build(
+                "/api/v1/balance-checks",
+                "POST",
+                serde_json::json!({"request_id":"key"}),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(
+            app.clone()
+                .oneshot(build(
+                    "/api/v1/balance-checks",
+                    "POST",
+                    serde_json::json!({"request_id":"other"}),
+                    true
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(build(
+                    "/api/v1/balance-checks/missing",
+                    "GET",
+                    serde_json::json!(null),
+                    true
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        let worker = crate::balance::BalanceService::new(
+            dispatcher.store.clone(),
+            dispatcher.clone(),
+            Arc::new(RwLock::new(HardwareState::Ready {
+                port_name: "COM1".into(),
+            })),
+        );
+        worker.tick().await.unwrap();
+        assert_eq!(dispatcher.sends.load(Ordering::SeqCst), 1);
+        let check = dispatcher.store.balance_check(id).unwrap().unwrap();
+        dispatcher
+            .store
+            .save_sms(&SmsRecord {
+                id: "carrier-reply".into(),
+                fingerprint: "new-reply".into(),
+                source: "sim".into(),
+                direction: "inbound".into(),
+                peer: "191".into(),
+                body: "TK goc: 85.500d; Khuyen mai: 100d".into(),
+                multipart_complete: true,
+                created_at_ms: check.dispatched_at_ms.unwrap(),
+                ..Default::default()
+            })
+            .unwrap();
+        worker.tick().await.unwrap();
+        let response = app
+            .clone()
+            .oneshot(build(
+                &format!("/api/v1/balance-checks/{id}"),
+                "GET",
+                serde_json::json!(null),
+                true,
+            ))
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(result["data"]["status"], "succeeded");
+        assert_eq!(result["data"]["balance"]["amount_vnd"], 85500);
+        assert!(!String::from_utf8_lossy(&bytes).contains("Khuyen mai"));
+        assert!(!String::from_utf8_lossy(&bytes).contains("baseline"));
+        assert!(dispatcher.store.next_webhook(now_ms()).unwrap().is_none());
+        let limited = app
+            .oneshot(build(
+                "/api/v1/balance-checks",
+                "POST",
+                serde_json::json!({"request_id":"later"}),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(limited.headers().contains_key(header::RETRY_AFTER));
     }
 
     async fn health_response(app: Router, auth: bool) -> (StatusCode, String, String) {

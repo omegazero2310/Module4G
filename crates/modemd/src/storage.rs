@@ -7,6 +7,7 @@ mod models;
 use delivery::*;
 mod audio;
 mod balance;
+mod balance_operations;
 mod calls;
 mod health;
 mod integration;
@@ -98,7 +99,7 @@ mod tests {
     #[test]
     fn migrates_and_round_trips_settings() {
         let store = Store::memory().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 10);
+        assert_eq!(store.schema_version().unwrap(), 11);
         let mut expected = Settings::default();
         expected.port_override = Some("COM6".into());
         store.save_settings(&expected, 42).unwrap();
@@ -274,7 +275,7 @@ mod tests {
         ).unwrap();
         let store = Store(Mutex::new(connection));
         store.migrate().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 10);
+        assert_eq!(store.schema_version().unwrap(), 11);
         assert_eq!(
             store
                 .connection()
@@ -308,6 +309,72 @@ mod tests {
         })
         .unwrap();
         assert_eq!(s.list_balances(10).unwrap()[0].sms_id, "s");
+    }
+
+    #[test]
+    fn balance_migration_preserves_all_existing_domains_and_pending_webhook() {
+        let store = Store::memory().unwrap();
+        let settings = Settings::default();
+        store.save_settings(&settings, 1).unwrap();
+        let integration = IntegrationSettings {
+            rest_token: "fixture-token".into(),
+            ..Default::default()
+        };
+        store.save_integration_settings(&integration, 1).unwrap();
+        store
+            .save_sms(&SmsRecord {
+                id: "sms".into(),
+                body: "retained".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .save_balance(&BalanceRecord {
+                id: "balance".into(),
+                raw: "retained".into(),
+                sms_id: "sms".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .save_call(&CallRecord {
+                id: "call".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .save_current_audio(&UploadedAudioRecord {
+                id: "audio".into(),
+                name: "call.amr".into(),
+                module_path: "call.amr".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .reserve_rest_communication(&RestCommunication {
+                id: "communication".into(),
+                request_id: "request".into(),
+                record_id: "sms".into(),
+                channel: "sms".into(),
+                status: "queued".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        {
+            let connection = store.connection().unwrap();
+            connection.execute("INSERT INTO webhook_outbox(communication_id,event_type,payload,next_attempt_at_ms) VALUES('communication','communication.sent','{}',1)", []).unwrap();
+            connection.execute_batch("DROP TABLE balance_operations; DELETE FROM schema_migrations WHERE version=11;").unwrap();
+        }
+        store.migrate().unwrap();
+        assert_eq!(store.schema_version().unwrap(), 11);
+        assert_eq!(store.load_settings().unwrap(), settings);
+        assert_eq!(store.load_integration_settings().unwrap(), integration);
+        assert_eq!(store.list_sms(10).unwrap()[0].body, "retained");
+        assert_eq!(store.list_balances(10).unwrap()[0].sms_id, "sms");
+        assert_eq!(store.list_calls(10).unwrap()[0].id, "call");
+        assert_eq!(store.list_audio().unwrap()[0].id, "audio");
+        assert!(store.rest_communication("communication").unwrap().is_some());
+        assert!(store.next_webhook(2).unwrap().is_some());
     }
 
     #[test]

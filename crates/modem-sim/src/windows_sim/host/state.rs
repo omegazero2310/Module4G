@@ -23,6 +23,11 @@ pub(super) struct SimState {
     pub(super) hang_attempts: u32,
     pub(super) sms: Vec<serde_json::Value>,
     pub(super) sms_polls: u32,
+    pub(super) balance_checks: Vec<serde_json::Value>,
+    pub(super) balance_history: Vec<serde_json::Value>,
+    pub(super) balance_polls: u32,
+    pub(super) balance_scenario: String,
+    pub(super) balance_cooldown: u32,
 }
 
 pub(super) fn advance_calls(state: &mut SimState) {
