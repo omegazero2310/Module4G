@@ -18,12 +18,16 @@ pub use models::{
     SmsRecord, UploadedAudioRecord, WebhookAttempt,
 };
 
-pub struct Store(Mutex<Connection>);
+pub struct Store(Mutex<Connection>, tokio::sync::Mutex<()>);
 
 impl Store {
+    /// Serialize snapshot, durable persistence and exact-slot archival together.
+    pub async fn sms_sync_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.1.lock().await
+    }
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ModemError> {
         let connection = Connection::open(path).map_err(db_error)?;
-        let store = Self(Mutex::new(connection));
+        let store = Self(Mutex::new(connection), tokio::sync::Mutex::new(()));
         store.migrate()?;
         Ok(store)
     }
@@ -273,7 +277,7 @@ mod tests {
              INSERT INTO webhook_outbox(communication_id,event_type,payload,next_attempt_at_ms)
                VALUES('old-id','communication.sent','{}',1);",
         ).unwrap();
-        let store = Store(Mutex::new(connection));
+        let store = Store(Mutex::new(connection), tokio::sync::Mutex::new(()));
         store.migrate().unwrap();
         assert_eq!(store.schema_version().unwrap(), 11);
         assert_eq!(

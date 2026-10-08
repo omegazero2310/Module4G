@@ -2,7 +2,7 @@
 
 > Status: implemented in source. Rebuild and restart the daemon to use these endpoints. Physical Viettel SIM acceptance is still pending. Responses use the existing status/message/data envelope; examples below focus on data.
 
-This API checks the Viettel SIM installed in the modem. A request makes the daemon send a verified carrier SMS query and wait for the carrier's reply. Sending the SMS successfully does not mean the balance is ready.
+This API checks the Viettel SIM installed in the modem. A request makes the daemon send the existing `TK` query to `191` and wait for the carrier's reply. Sending the SMS successfully does not mean the balance is ready; verify this carrier profile on your SIM during hardware acceptance.
 
 See the [implementation plan](docs/plans/2026-10-08-viettel-balance-rest-ui.md) for service, UI, persistence, and hardware acceptance work.
 
@@ -107,7 +107,7 @@ Successful response: `200 OK`.
 
 Amounts and timestamps above are illustrative. `amount_vnd` is an integer number of Vietnamese dong. Zero is a valid balance; null means no balance was obtained for this operation. The balance represents a carrier observation at `observed_at`, rather than a continuously live value.
 
-The service allows 120 seconds to schedule a queued request, then starts a 120-second reply window when dispatch is claimed. Restart preserves the deadline and never automatically resends a possibly submitted query. Successful or explicitly failed checks impose a 60-second cooldown; timed-out checks impose a five-minute quarantine after their deadline. `request_id` accepts 1–256 bytes, must contain a non-whitespace character, and has a separate namespace from communication request IDs.
+The service allows 120 seconds to schedule a queued request, then starts a 120-second reply window when dispatch is claimed. Delivery configuration and inbox preparation happen before that claim. The serial actor rejects an expired query before writing to the modem. Restart preserves the deadline and never automatically resends a possibly submitted query. Successful or explicitly failed checks impose a 60-second cooldown; timed-out checks impose a five-minute quarantine after their deadline. `request_id` accepts 1–256 bytes, must contain a non-whitespace character, and has a separate namespace from communication request IDs.
 
 | Status | Client behavior |
 | --- | --- |

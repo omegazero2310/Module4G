@@ -49,6 +49,7 @@ pub(super) async fn run_actor(
             command,
             payload,
             guarded,
+            not_after_ms: None,
             payload_mode: PayloadMode::Sms,
             batch: Vec::new(),
             finalizer: None,

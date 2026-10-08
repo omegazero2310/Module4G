@@ -95,6 +95,7 @@ pub(super) async fn handle_client(
                             command,
                             payload: None,
                             guarded: true,
+                            not_after_ms: None,
                             payload_mode: PayloadMode::Sms,
                             batch: Vec::new(),
                             finalizer: None,
@@ -589,6 +590,7 @@ pub(super) async fn send_sms_json(
         store,
         delivery_capability,
         delivery_configuration,
+        None,
     )
     .await
 }
@@ -600,6 +602,7 @@ pub(super) async fn send_sms_with_id(
     store: &Store,
     delivery_capability: &Arc<RwLock<DeliveryCapability>>,
     delivery_configuration: &Arc<tokio::sync::Mutex<()>>,
+    not_after_ms: Option<i64>,
 ) -> Result<SmsRecord, String> {
     let peer = modemd::sms::normalize_sms_destination(
         v.get("destination")
@@ -654,12 +657,17 @@ pub(super) async fn send_sms_with_id(
     record.delivery_report_requested = capability.report_request_available;
     record.delivery_tracking_error = capability.error.clone();
     store.save_sms(&record).map_err(|e| e.to_string())?;
-    let result = actor_lines(
-        tx,
-        format!("AT+CMGS=\"{peer}\""),
-        Some(body.clone().into_bytes()),
-    )
-    .await;
+    let result = if not_after_ms.is_some_and(|deadline| now() >= deadline) {
+        Err("balance dispatch deadline expired before submission".into())
+    } else {
+        actor_lines_before(
+            tx,
+            format!("AT+CMGS=\"{peer}\""),
+            Some(body.clone().into_bytes()),
+            not_after_ms,
+        )
+        .await
+    };
     let lines = match result {
         Ok(lines) => lines,
         Err(error) => {
@@ -700,6 +708,7 @@ pub(super) async fn send_sms_with_id(
 pub(super) fn is_explicit_send_rejection(error: &str) -> bool {
     let upper = error.to_ascii_uppercase();
     upper.contains("COMMAND REJECTED")
+        || upper.contains("BALANCE DISPATCH DEADLINE EXPIRED")
         || upper.contains("+CMS ERROR")
         || upper.contains("+CME ERROR")
         || upper.trim_end().ends_with("ERROR")

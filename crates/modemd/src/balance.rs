@@ -153,7 +153,10 @@ impl BalanceService {
         };
         let _ = self
             .dispatcher
-            .send_sms(check.id.clone(), "191".into(), "TK".into())
+            .send_balance_sms(
+                check.id.clone(),
+                check.deadline_ms.expect("claimed check has deadline"),
+            )
             .await;
         let outgoing = self
             .store

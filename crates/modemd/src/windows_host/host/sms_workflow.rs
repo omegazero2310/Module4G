@@ -118,6 +118,7 @@ pub(super) async fn sync_sms_json(
     tx: &mpsc::Sender<hardware::AtRequest>,
     store: &Store,
 ) -> Result<usize, String> {
+    let _sync = store.sms_sync_guard().await;
     let lines = actor_pdu_snapshot(tx).await?;
     let stamp = now();
     let records = snapshot_records(modemd::sms::parse_cmgl(&lines), stamp);
@@ -316,6 +317,7 @@ pub(super) async fn actor_batch_lines(
         command: String::new(),
         payload: None,
         guarded: false,
+        not_after_ms: None,
         payload_mode: PayloadMode::Sms,
         batch,
         finalizer,

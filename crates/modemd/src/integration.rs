@@ -234,6 +234,9 @@ pub trait CommunicationDispatcher: Send + Sync {
     async fn prepare_balance_check(&self) -> Result<(), DispatchError> {
         Ok(())
     }
+    async fn send_balance_sms(&self, id: String, _not_after_ms: i64) -> Result<(), DispatchError> {
+        self.send_sms(id, "191".into(), "TK".into()).await
+    }
     async fn send_sms(
         &self,
         id: String,

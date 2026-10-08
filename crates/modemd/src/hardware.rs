@@ -75,49 +75,12 @@ pub fn monitor_with_commands(
             match commands.recv_timeout(Duration::from_millis(100)) {
                 Ok(request) => {
                     let port = modem.as_mut().expect("presence checked").port();
-                    let result = if request.batch.is_empty() {
-                        match request.payload_mode {
-                            PayloadMode::Download { max_bytes } => execute_raw_download(
-                                port,
-                                &request.command,
-                                max_bytes,
-                                RAW_RESULT_TIMEOUT,
-                                &mut dispatcher,
-                            )
-                            .map(AtResponse::Data),
-                            _ => execute_command(
-                                port,
-                                &request.command,
-                                request.payload.as_deref(),
-                                request.guarded,
-                                request.payload.as_ref().map_or_else(
-                                    || command_timeout(&request.command),
-                                    |_| {
-                                        payload_timeout(
-                                            request.payload.as_deref(),
-                                            request.payload_mode,
-                                        )
-                                    },
-                                ),
-                                request.payload_mode,
-                                &mut dispatcher,
-                            )
-                            .map(AtResponse::Lines),
-                        }
-                    } else {
-                        run_batch(&request.batch, request.finalizer.as_deref(), |command| {
-                            execute_command(
-                                port,
-                                command,
-                                None,
-                                false,
-                                command_timeout(command),
-                                PayloadMode::Sms,
-                                &mut dispatcher,
-                            )
-                        })
-                        .map(AtResponse::Lines)
-                    };
+                    let result = execute_actor_request(
+                        port,
+                        &request,
+                        &mut dispatcher,
+                        crate::integration::now_ms(),
+                    );
                     publish_sms_events(&mut dispatcher, &sms_events);
                     if result_confirms_liveness(&result) {
                         next_health_check = Instant::now() + HEALTH_CHECK_INTERVAL;
@@ -206,6 +169,60 @@ pub fn monitor_with_commands(
     }
 }
 
+fn execute_actor_request(
+    port: &mut dyn SerialPort,
+    request: &AtRequest,
+    dispatcher: &mut Dispatcher,
+    now_ms: i64,
+) -> Result<AtResponse, ModemError> {
+    if request
+        .not_after_ms
+        .is_some_and(|deadline| now_ms >= deadline)
+    {
+        return Err(ModemError::Validation(
+            "balance dispatch deadline expired before submission".into(),
+        ));
+    }
+    if request.batch.is_empty() {
+        match request.payload_mode {
+            PayloadMode::Download { max_bytes } => execute_raw_download(
+                port,
+                &request.command,
+                max_bytes,
+                RAW_RESULT_TIMEOUT,
+                dispatcher,
+            )
+            .map(AtResponse::Data),
+            _ => execute_command(
+                port,
+                &request.command,
+                request.payload.as_deref(),
+                request.guarded,
+                request.payload.as_ref().map_or_else(
+                    || command_timeout(&request.command),
+                    |_| payload_timeout(request.payload.as_deref(), request.payload_mode),
+                ),
+                request.payload_mode,
+                dispatcher,
+            )
+            .map(AtResponse::Lines),
+        }
+    } else {
+        run_batch(&request.batch, request.finalizer.as_deref(), |command| {
+            execute_command(
+                port,
+                command,
+                None,
+                false,
+                command_timeout(command),
+                PayloadMode::Sms,
+                dispatcher,
+            )
+        })
+        .map(AtResponse::Lines)
+    }
+}
+
 fn publish_if_changed(
     previous: &mut Option<HardwareState>,
     state: HardwareState,
@@ -220,6 +237,28 @@ fn publish_if_changed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expired_actor_request_is_rejected_without_serial_writes() {
+        let mut port = ScriptedPort::new([ReadStep::Bytes(b"OK\r\n".to_vec())]);
+        let (reply, _) = tokio::sync::oneshot::channel();
+        let request = AtRequest {
+            command: "AT".into(),
+            payload: None,
+            guarded: false,
+            not_after_ms: Some(1000),
+            payload_mode: PayloadMode::Sms,
+            batch: vec![],
+            finalizer: None,
+            reply,
+        };
+        let result = execute_actor_request(&mut port, &request, &mut Dispatcher::default(), 1001);
+        assert!(
+            matches!(result, Err(ModemError::Validation(_))),
+            "expired request must be rejected before execution"
+        );
+        assert!(port.writes.is_empty());
+    }
     use serialport::{ClearBuffer, DataBits, FlowControl, Parity, StopBits};
     use std::{
         collections::VecDeque,

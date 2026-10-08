@@ -478,6 +478,20 @@ pub mod host {
             if !self.call_manager.sms_sync_allowed() {
                 return Err(DispatchError::Unavailable("modem is busy".into()));
             }
+            let _configuration = self.delivery_configuration.lock().await;
+            let needs_configuration = !self
+                .delivery_capability
+                .read()
+                .unwrap_or_else(|lock| lock.into_inner())
+                .attempted;
+            if needs_configuration {
+                let capability = configure_delivery_tracking(&self.command_tx).await;
+                *self
+                    .delivery_capability
+                    .write()
+                    .unwrap_or_else(|lock| lock.into_inner()) = capability;
+            }
+            drop(_configuration);
             sync_sms_json(&self.command_tx, &self.store)
                 .await
                 .map(|_| ())
@@ -499,10 +513,29 @@ pub mod host {
                 &self.store,
                 &self.delivery_capability,
                 &self.delivery_configuration,
+                None,
             )
             .await
             // The SMS workflow persists both confirmed rejection and unknown
             // submission outcomes. Reconciliation maps that durable state.
+            .map(|_| ())
+            .or(Ok(()))
+        }
+        async fn send_balance_sms(
+            &self,
+            id: String,
+            not_after_ms: i64,
+        ) -> Result<(), DispatchError> {
+            send_sms_with_id(
+                id,
+                serde_json::json!({"destination":"191","body":"TK"}),
+                &self.command_tx,
+                &self.store,
+                &self.delivery_capability,
+                &self.delivery_configuration,
+                Some(not_after_ms),
+            )
+            .await
             .map(|_| ())
             .or(Ok(()))
         }
@@ -582,11 +615,21 @@ pub mod host {
         command: String,
         payload: Option<Vec<u8>>,
     ) -> Result<Vec<String>, String> {
+        actor_lines_before(tx, command, payload, None).await
+    }
+
+    async fn actor_lines_before(
+        tx: &mpsc::Sender<hardware::AtRequest>,
+        command: String,
+        payload: Option<Vec<u8>>,
+        not_after_ms: Option<i64>,
+    ) -> Result<Vec<String>, String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         tx.send(hardware::AtRequest {
             command,
             payload,
             guarded: false,
+            not_after_ms,
             payload_mode: PayloadMode::Sms,
             batch: Vec::new(),
             finalizer: None,
@@ -613,6 +656,112 @@ pub mod host {
         use modemd::settings::Settings;
         use modemd::storage::{BalanceRecord, SmsRecord, Store};
         use std::{collections::HashSet, sync::RwLock};
+
+        #[tokio::test]
+        async fn balance_sms_carries_deadline_and_expired_dispatch_is_not_enqueued() {
+            use modemd::hardware::{AtRequest, AtResponse};
+            use std::sync::{Arc, mpsc};
+            let store = Store::memory().unwrap();
+            let capability = Arc::new(RwLock::new(super::DeliveryCapability {
+                attempted: true,
+                ..Default::default()
+            }));
+            let configuration = Arc::new(tokio::sync::Mutex::new(()));
+            let deadline = super::now() + 60_000;
+            let (tx, rx) = mpsc::channel::<AtRequest>();
+            let actor = std::thread::spawn(move || {
+                let mut requests = 0;
+                while let Ok(request) = rx.recv() {
+                    requests += 1;
+                    assert_eq!(request.not_after_ms, Some(deadline));
+                    let _ = request
+                        .reply
+                        .send(Ok(AtResponse::Lines(vec!["+CMGS: 42".into(), "OK".into()])));
+                }
+                requests
+            });
+            let payload = serde_json::json!({"destination":"191","body":"TK"});
+            let sent = super::send_sms_with_id(
+                "valid".into(),
+                payload.clone(),
+                &tx,
+                &store,
+                &capability,
+                &configuration,
+                Some(deadline),
+            )
+            .await
+            .unwrap();
+            assert_eq!(sent.state, "submitted");
+            assert!(
+                super::send_sms_with_id(
+                    "expired".into(),
+                    payload,
+                    &tx,
+                    &store,
+                    &capability,
+                    &configuration,
+                    Some(super::now() - 1)
+                )
+                .await
+                .is_err()
+            );
+            let expired = store
+                .list_sms(10)
+                .unwrap()
+                .into_iter()
+                .find(|sms| sms.id == "expired")
+                .unwrap();
+            assert_eq!(expired.state, "send-failed");
+            drop(tx);
+            assert_eq!(actor.join().unwrap(), 1);
+        }
+
+        #[tokio::test]
+        async fn concurrent_sms_sync_archives_a_slot_only_once() {
+            use modemd::hardware::{AtRequest, AtResponse};
+            use std::{sync::mpsc, time::Duration};
+            let store = Store::memory().unwrap();
+            let (tx, rx) = mpsc::channel::<AtRequest>();
+            let actor = std::thread::spawn(move || {
+                let mut resident = true;
+                let mut deletes = 0;
+                while let Ok(request) = rx.recv() {
+                    let snapshot = request.batch.iter().any(|command| command == "AT+CMGL=4");
+                    let lines = if snapshot {
+                        std::thread::sleep(Duration::from_millis(10));
+                        if resident {
+                            vec!["+CMGL: 1,0,,4".into(), "XYZ".into(), "OK".into()]
+                        } else {
+                            vec!["OK".into()]
+                        }
+                    } else {
+                        for command in &request.batch {
+                            if command == "AT+CMGD=1" {
+                                deletes += 1;
+                                resident = false;
+                            }
+                        }
+                        vec!["OK".into()]
+                    };
+                    let _ = request.reply.send(Ok(AtResponse::Lines(lines)));
+                }
+                deletes
+            });
+            let (first, second) = tokio::join!(
+                super::sync_sms_json(&tx, &store),
+                super::sync_sms_json(&tx, &store)
+            );
+            first.unwrap();
+            second.unwrap();
+            drop(tx);
+            assert_eq!(
+                actor.join().unwrap(),
+                1,
+                "duplicate CMGD can delete a newly reused slot"
+            );
+            assert_eq!(store.list_sms(10).unwrap().len(), 1);
+        }
 
         #[test]
         fn monitor_settings_snapshot_releases_the_read_lock() {

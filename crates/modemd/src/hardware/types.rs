@@ -56,6 +56,8 @@ pub struct AtRequest {
     pub command: String,
     pub payload: Option<Vec<u8>>,
     pub guarded: bool,
+    /// Reject before writing anything if a queued request expires.
+    pub not_after_ms: Option<i64>,
     pub payload_mode: PayloadMode,
     /// Commands executed under one actor dequeue, preventing mode changes from
     /// interleaving with unrelated requests. The finalizer is always attempted.
