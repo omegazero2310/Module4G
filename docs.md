@@ -30,6 +30,43 @@ $modemApiHeaders = @{
 }
 ```
 
+### cURL example (PowerShell)
+
+Use `curl.exe` in PowerShell so the command invokes cURL rather than the PowerShell `curl` alias. Set the token in your process environment using your normal secret-management mechanism.
+
+```powershell
+$modemApiCurlAuth = 'Authorization: Bearer ' + $env:MODEMD_REST_TOKEN
+```
+
+Start a balance check with a unique request ID:
+
+```powershell
+$balanceRequestId = [guid]::NewGuid().ToString()
+curl.exe -i `
+    -X POST `
+    "$modemApiBase/api/v1/balance-checks" `
+    -H $modemApiCurlAuth `
+    -H 'Content-Type: application/json' `
+    --data-raw ('{"request_id":"' + $balanceRequestId + '"}')
+```
+
+The response includes `data.id`. Use that ID to retrieve the operation; poll this endpoint until its status is terminal:
+
+```powershell
+$balanceCheckId = '<id returned by the POST request>'
+curl.exe -i `
+    "$modemApiBase/api/v1/balance-checks/$balanceCheckId" `
+    -H $modemApiCurlAuth
+```
+
+To read the latest stored balance without starting another check:
+
+```powershell
+curl.exe -i `
+    "$modemApiBase/api/v1/balance" `
+    -H $modemApiCurlAuth
+```
+
 ## 1. Start a balance check
 
 Endpoint: `POST /api/v1/balance-checks`.
@@ -223,4 +260,3 @@ The current profile retains the existing `TK` SMS to `191` query. Only a new com
 Verify that this query returns the desired main monetary balance for the installed SIM before production use. A five-minute quarantine reduces late-reply ambiguity; carrier SMS has no request ID, so exact attribution of arbitrarily delayed replies cannot be guaranteed. The current hardware status does not expose SIM identity: after replacing the SIM, treat stored snapshots as belonging to the previous SIM until a successful check of the new SIM. Automatic SIM-swap invalidation is not implemented.
 
 For desktop transport clients, the additive commands are `start_balance_check` with `request_id`, `get_balance_check` with `id`, and `get_latest_balance`. Tauri uses `requestId` for the start command argument. Existing `check_balance` and `list_balance_checks` command names remain supported; the synchronous legacy check now shares the durable workflow and can outlast older client timeouts. Prefer the asynchronous commands.
-

@@ -148,6 +148,8 @@ Setup installs `modem-app.exe` and `modemd.exe` under the selected Program Files
 
 After staging the drivers, setup creates or canonicalizes `A7670ModemService` as `NT AUTHORITY\LocalService`, configures delayed automatic startup and 5/15/60-second recovery restarts, and verifies that the service starts.
 
+Setup grants LocalService access to the actual common ProgramData directory and stores a quoted service executable path so installations under Program Files are safe. To verify the service hooks without changing installed services or drivers, run `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\test-installer-hooks.ps1` from the repository root after Tauri has downloaded its NSIS tools. This compiles the hooks with warnings treated as errors and runs fresh-install and reinstall scenarios against command fixtures. A real elevated setup run is still needed for machine acceptance.
+
 Reinstalling or upgrading stops the service before replacing `modemd.exe`, stages the drivers without forcing an older version, reapplies the service's canonical configuration, and starts the bundled version. Normal uninstall stops and deletes the service before removing the application binaries and bundled driver source files. It deliberately leaves the published driver packages in the Windows Driver Store because connected hardware may still use them. Installation, upgrade, and uninstall always retain `%ProgramData%\A7670 Modem`, including the SQLite database, settings, history, integration secrets, and pending webhook records.
 
 Verify driver staging and the AT port from an elevated PowerShell prompt:

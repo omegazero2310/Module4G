@@ -47,8 +47,8 @@ Function ModemdStopBeforeInstall
 FunctionEnd
 
 Function ModemdInstallAndStart
-  CreateDirectory "$COMMONAPPDATA\A7670 Modem"
-  nsExec::ExecToStack '"$SYSDIR\icacls.exe" "$COMMONAPPDATA\A7670 Modem" /grant *S-1-5-19:(OI)(CI)M /T /C'
+  CreateDirectory "$COMMONPROGRAMDATA\A7670 Modem"
+  nsExec::ExecToStack '"$SYSDIR\icacls.exe" "$COMMONPROGRAMDATA\A7670 Modem" /grant *S-1-5-19:(OI)(CI)M /T /C'
   Pop $0
   Pop $1
   ${If} $0 != 0
@@ -59,9 +59,9 @@ Function ModemdInstallAndStart
   !insertmacro ModemdQueryService ""
   Pop $2
   ${If} $2 == 1
-    nsExec::ExecToStack '"$SYSDIR\sc.exe" config "${MODEMD_SERVICE}" binPath= $\"$INSTDIR\modemd.exe$\" start= delayed-auto obj= $\"NT AUTHORITY\LocalService$\"'
+    nsExec::ExecToStack '"$SYSDIR\sc.exe" config "${MODEMD_SERVICE}" binPath= $\"\$\"$INSTDIR\modemd.exe\$\"$\" start= delayed-auto obj= $\"NT AUTHORITY\LocalService$\"'
   ${Else}
-    nsExec::ExecToStack '"$SYSDIR\sc.exe" create "${MODEMD_SERVICE}" binPath= $\"$INSTDIR\modemd.exe$\" start= delayed-auto obj= $\"NT AUTHORITY\LocalService$\" DisplayName= $\"A7670 Modem Service$\"'
+    nsExec::ExecToStack '"$SYSDIR\sc.exe" create "${MODEMD_SERVICE}" binPath= $\"\$\"$INSTDIR\modemd.exe\$\"$\" start= delayed-auto obj= $\"NT AUTHORITY\LocalService$\" DisplayName= $\"A7670 Modem Service$\"'
   ${EndIf}
   Pop $0
   Pop $1
